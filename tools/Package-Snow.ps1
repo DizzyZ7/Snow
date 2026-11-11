@@ -27,7 +27,7 @@ if (-not (Test-Path -LiteralPath $installerScript -PathType Leaf)) { throw "Inst
 
 # The artifact name promises x64. Reject an arbitrary file or an accidental Win32 build.
 $stream = [System.IO.File]::OpenRead($resolvedExe)
-$reader = New-Object System.IO.BinaryReader($stream)
+$reader = New-Object System.IO.BinaryReader -ArgumentList $stream
 try {
     if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) { throw 'Exe is not a PE executable.' }
     $stream.Position = 0x3C
@@ -132,7 +132,7 @@ See README.md and docs/PROFILING.md in the source repository for validation step
     $checksumLines | Set-Content -LiteralPath (Join-Path $stagedOutput $checksumsName) -Encoding ASCII
     [void][System.IO.Directory]::CreateDirectory($output)
     foreach ($name in ($artifacts + $checksumsName)) {
-        Copy-Item -LiteralPath (Join-Path $stagedOutput $name) -Destination (Join-Path $output $name) -ErrorAction Stop
+        [System.IO.File]::Copy((Join-Path $stagedOutput $name), (Join-Path $output $name), $false)
     }
     Write-Host "Packaged $baseName into $output"
     Write-Host "Installer: $installerStatus"

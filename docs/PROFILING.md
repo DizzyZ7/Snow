@@ -81,8 +81,9 @@ workloads stable and capture any tray notification that reports GDI fallback.
 `RendererRequested` records the command-line request, not proof of the actual
 renderer: D3D11 may fall back to GDI. The metadata makes this limit explicit.
 
-These separate runs include startup in their CPU baseline and sample every
-five seconds. Run both renderers on the same machine, repeating each comparison
+These separate runs start a fresh process and sample every five seconds after
+the initial CPU baseline is read. Startup before that baseline is not measured.
+Run both renderers on the same machine, repeating each comparison
 at least three times. Each profile launches its own process, samples only that
 process identity, then requests graceful exit. Commands do not manufacture
 results when a counter or process is unavailable.
@@ -114,7 +115,7 @@ row. Sampling and CIM queries add overhead, so actual timestamps and intervals
 are recorded and missed deadlines are skipped. Windows sleep/resume and slow
 providers can create gaps; do not interpret these gaps as continuous samples.
 Total wall-clock duration can exceed the requested duration by collection and
-graceful shutdown overhead. The optional `*.metadata.json` companion is always
+graceful shutdown overhead. The `*.metadata.json` companion is always
 attempted, including failures; it records run outcome, environment, executable
 hash, sample count, requested interval and elapsed sampling time.
 
