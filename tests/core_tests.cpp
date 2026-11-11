@@ -1,4 +1,5 @@
 #include "core.hpp"
+#include "performance_monitor.hpp"
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -104,6 +105,36 @@ void simulationTests() {
     a.setBounds({0, 0, 0, 0}); a.advance(.01); a.buildScene(scene);
     check(scene.empty(), "empty desktop has no scene");
 }
+void sceneClipTests() {
+    snow::SnowSimulation sim(11); sim.setBounds({0, 0, 1000, 800});
+    snow::Settings cfg; cfg.weather = snow::Weather::Custom; cfg.particles = 0; cfg.maxDepth = 96;
+    sim.setSettings(cfg);
+    for (int i = 0; i < 200; ++i) sim.advance(1.0 / 60.0);
+    auto s = surface(7, 0, 600, 1000); s.visible = {{100, 200}};
+    sim.accumulation().reconcile(std::span(&s, 1));
+    for (int i = 0; i < 50; ++i) sim.accumulation().deposit(150, 500, 610, 1000, 96);
+    std::vector<snow::DrawItem> scene; scene.reserve(snow::MaxDrawItems); sim.buildScene(scene);
+    for (const auto& item : scene) {
+        check(item.x >= 100 && item.x + item.w <= 200, "snow crest stays inside visible interval");
+        check(item.y >= 504, "snow stays inside tracked 96px band");
+    }
+    check(sim.useTool(snow::Tool::Snowman, 150, 600), "snowman consumes deep snow");
+    sim.buildScene(scene);
+    for (const auto& item : scene) check(item.y >= 504, "snowman stays inside tracked band");
+    s.visible = {{148, 152}}; sim.accumulation().reconcile(std::span(&s, 1)); sim.buildScene(scene);
+    for (const auto& item : scene) check(item.x >= 148 && item.x + item.w <= 152, "partly occluded snowman is hidden");
+}
+void performanceTests() {
+    snow::PerformanceMonitor monitor;
+    check(monitor.interval(snow::Profile::Balanced, false, false, 0) == 33, "balanced is the default 30 FPS budget");
+    check(monitor.interval(snow::Profile::Quality, true, false, 0) == 67, "battery reduces frame rate");
+    check(monitor.interval(snow::Profile::Quality, false, true, 0) == 67, "energy saver reduces frame rate");
+    check(monitor.interval(snow::Profile::Quality, false, false, .95) >= 33, "high system load reduces frame rate");
+    for (int i = 0; i < 80; ++i) monitor.recordFrame(.04);
+    check(monitor.interval(snow::Profile::Quality, false, false, 0) == 67, "expensive frames lower budget");
+    for (int i = 0; i < 1000; ++i) monitor.recordFrame(.001);
+    check(monitor.interval(snow::Profile::Quality, false, false, 0) == 16, "sustained cheap frames recover with hysteresis");
+}
 void toolsTests() {
     snow::SnowSimulation sim(11); sim.setBounds({0, 0, 1000, 800});
     auto s = surface(7, 0, 600, 1000); sim.accumulation().reconcile(std::span(&s, 1));
@@ -118,7 +149,7 @@ void toolsTests() {
 }
 }
 int main() {
-    try { settingsTests(); heightTests(); accumulationTests(); simulationTests(); toolsTests(); }
+    try { settingsTests(); heightTests(); accumulationTests(); simulationTests(); sceneClipTests(); performanceTests(); toolsTests(); }
     catch (const std::exception& e) { std::cerr << "FAIL after " << checks << ": " << e.what() << '\n'; return 1; }
     std::cout << "PASS: " << checks << " assertions (settings, height fields, accumulation, simulation, tools)\n";
 }

@@ -269,7 +269,11 @@ void SnowSimulation::step(float dt) {
         const bool landed = settings_.accumulation && accumulation_.deposit(p.x, oldY, p.y, p.radius * p.radius * 7 * settings_.accumulationRate, settings_.maxDepth);
         if (landed || p.y > static_cast<float>(bounds_.bottom) + 8) spawn(p, false);
     }
-    std::erase_if(decorations_, [&](Decoration& d) { d.age += dt; return accumulation_.find(d.surfaceId) == nullptr; });
+    std::erase_if(decorations_, [&](Decoration& d) {
+        d.age = std::min(d.age + dt, 1.f);
+        const auto* state = accumulation_.find(d.surfaceId);
+        return !state || d.localX < 0 || d.localX >= static_cast<float>(state->field.width());
+    });
 }
 bool SnowSimulation::useTool(Tool tool, float x, float y) {
     if (!std::isfinite(x) || !std::isfinite(y)) return false;
@@ -301,7 +305,9 @@ void SnowSimulation::buildScene(std::vector<DrawItem>& scene) const {
                 if (end <= left) continue;
                 add({left, static_cast<float>(s.spec.bounds.top) - h, end - left, h, .91f, .95f, 1, .94f, 0});
                 // A soft bright crest makes coarse height bins read as snow rather than columns.
-                add({left - 1, static_cast<float>(s.spec.bounds.top) - h - 2, end - left + 2, 5, .98f, .99f, 1, .9f, 1});
+                const float top = static_cast<float>(s.spec.bounds.top);
+                const float crest = std::max(top - 96, top - h - 2);
+                add({left, crest, end - left, std::min(5.f, top - crest), .98f, .99f, 1, .9f, 1});
             }
         }
     }
@@ -312,8 +318,15 @@ void SnowSimulation::buildScene(std::vector<DrawItem>& scene) const {
     for (const auto& d : decorations_) {
         const auto* s = accumulation_.find(d.surfaceId); if (!s) continue;
         const float x = static_cast<float>(s->spec.bounds.left) + d.localX;
-        if (!visible(s->spec, x)) continue;
-        const float y = static_cast<float>(s->spec.bounds.top) - s->field.height(d.localX);
+        const bool fits = std::any_of(s->spec.visible.begin(), s->spec.visible.end(), [&](Span span) {
+            return x - d.radius >= static_cast<float>(span.left) && x + d.radius <= static_cast<float>(span.right);
+        });
+        if (!fits) continue;
+        // Keep figures inside the same 96px band used by occlusion tracking.
+        // Deep drifts partly bury their base rather than letting them cross a higher window.
+        const float figureHeight = d.radius * (d.kind == Tool::Snowman ? 4.17f : 2.f);
+        const float rise = std::min(s->field.height(d.localX), std::max(0.f, 96 - figureHeight - 8));
+        const float y = static_cast<float>(s->spec.bounds.top) - rise;
         const float bounce = d.age < .5f ? std::sin(d.age * 6.2831853f) * 8 * (1 - d.age * 2) : 0;
         const float radius = d.radius;
         auto circle = [&](float cx, float cy, float r, float red, float green, float blue) { add({cx - r, cy - r - bounce, r * 2, r * 2, red, green, blue, 1, 1}); };
