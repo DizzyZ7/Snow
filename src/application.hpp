@@ -5,7 +5,7 @@
 namespace snow {
 class Application {
 public:
-    Application(HINSTANCE instance, bool smokeTest, bool gpu);
+    Application(HINSTANCE instance, bool smokeTest, bool gpu, bool benchmark = false);
     ~Application();
     Application(const Application&) = delete;
     Application& operator=(const Application&) = delete;

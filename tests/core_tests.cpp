@@ -3,6 +3,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -79,7 +80,9 @@ void accumulationTests() {
     model.reconcile(many); check(model.surfaces().size() <= snow::MaxSurfaces, "surface count bounded");
 }
 void simulationTests() {
-    snow::SnowSimulation a(42), b(42);
+    auto aStorage = std::make_unique<snow::SnowSimulation>(42);
+    auto bStorage = std::make_unique<snow::SnowSimulation>(42);
+    auto& a = *aStorage; auto& b = *bStorage;
     a.setBounds({-1920, -200, 1920, 1080}); b.setBounds({-1920, -200, 1920, 1080});
     snow::Settings cfg; cfg.weather = snow::Weather::Custom; cfg.particles = 200;
     a.setSettings(cfg); b.setSettings(cfg);
@@ -106,7 +109,8 @@ void simulationTests() {
     check(scene.empty(), "empty desktop has no scene");
 }
 void sceneClipTests() {
-    snow::SnowSimulation sim(11); sim.setBounds({0, 0, 1000, 800});
+    auto storage = std::make_unique<snow::SnowSimulation>(11); auto& sim = *storage;
+    sim.setBounds({0, 0, 1000, 800});
     snow::Settings cfg; cfg.weather = snow::Weather::Custom; cfg.particles = 0; cfg.maxDepth = 96;
     sim.setSettings(cfg);
     for (int i = 0; i < 200; ++i) sim.advance(1.0 / 60.0);
@@ -124,6 +128,22 @@ void sceneClipTests() {
     s.visible = {{148, 152}}; sim.accumulation().reconcile(std::span(&s, 1)); sim.buildScene(scene);
     for (const auto& item : scene) check(item.x >= 148 && item.x + item.w <= 152, "partly occluded snowman is hidden");
 }
+void saturatedInputTests() {
+    auto storage = std::make_unique<snow::SnowSimulation>(17); auto& sim = *storage;
+    sim.setBounds({0, 0, 7680, 4320});
+    std::vector<snow::SurfaceSpec> surfaces;
+    for (std::uint64_t i = 0; i < 21; ++i) surfaces.push_back(surface(i + 1, 0, 120 + static_cast<int>(i) * 200, 7680));
+    sim.accumulation().reconcile(surfaces);
+    for (auto& state : sim.accumulation().surfaces())
+        for (int x = 0; x < 7680; x += 24) state.field.deposit(static_cast<float>(x), 400, 48);
+    std::vector<snow::DrawItem> scene; scene.reserve(snow::MaxDrawItems);
+    sim.buildScene(scene); check(scene.size() == snow::MaxDrawItems, "dense 8K scene reaches cap");
+    sim.buildScene(scene, true);
+    check(scene.size() == snow::MaxDrawItems, "interactive scene respects same cap");
+    const auto& plane = scene.back();
+    check(plane.x == 0 && plane.y == 0 && plane.w == 7680 && plane.h == 4320 && plane.a > 0,
+          "input plane always present in saturated scene");
+}
 void performanceTests() {
     snow::PerformanceMonitor monitor;
     check(monitor.interval(snow::Profile::Balanced, false, false, 0) == 33, "balanced is the default 30 FPS budget");
@@ -136,7 +156,8 @@ void performanceTests() {
     check(monitor.interval(snow::Profile::Quality, false, false, 0) == 16, "sustained cheap frames recover with hysteresis");
 }
 void toolsTests() {
-    snow::SnowSimulation sim(11); sim.setBounds({0, 0, 1000, 800});
+    auto storage = std::make_unique<snow::SnowSimulation>(11); auto& sim = *storage;
+    sim.setBounds({0, 0, 1000, 800});
     auto s = surface(7, 0, 600, 1000); sim.accumulation().reconcile(std::span(&s, 1));
     check(!sim.useTool(snow::Tool::Snowball, 100, 600), "cannot create snow from nothing");
     for (int i = 0; i < 20; ++i) sim.accumulation().deposit(100, 590, 610, 1000, 48);
@@ -149,7 +170,7 @@ void toolsTests() {
 }
 }
 int main() {
-    try { settingsTests(); heightTests(); accumulationTests(); simulationTests(); sceneClipTests(); performanceTests(); toolsTests(); }
+    try { settingsTests(); heightTests(); accumulationTests(); simulationTests(); sceneClipTests(); saturatedInputTests(); performanceTests(); toolsTests(); }
     catch (const std::exception& e) { std::cerr << "FAIL after " << checks << ": " << e.what() << '\n'; return 1; }
     std::cout << "PASS: " << checks << " assertions (settings, height fields, accumulation, simulation, tools)\n";
 }

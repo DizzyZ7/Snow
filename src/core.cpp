@@ -290,9 +290,10 @@ bool SnowSimulation::useTool(Tool tool, float x, float y) {
     decorations_.push_back({state->spec.id, local, tool == Tool::Snowball ? 11.f : 16.f, 0, tool});
     return true;
 }
-void SnowSimulation::buildScene(std::vector<DrawItem>& scene) const {
+void SnowSimulation::buildScene(std::vector<DrawItem>& scene, bool interactive) const {
     scene.clear(); if (!bounds_.valid()) return;
-    const auto add = [&](DrawItem item) { if (scene.size() < MaxDrawItems) scene.push_back(item); };
+    const std::size_t budget = MaxDrawItems - (interactive ? 1 : 0);
+    const auto add = [&](DrawItem item) { if (scene.size() < budget) scene.push_back(item); };
     if (settings_.accumulation) for (const auto& s : accumulation_.surfaces()) {
         const auto cells = s.field.cells();
         for (std::size_t i = 0; i < cells.size(); ++i) {
@@ -340,5 +341,7 @@ void SnowSimulation::buildScene(std::vector<DrawItem>& scene) const {
             add({x - 10, y - radius * 3.05f - bounce, 20, 4, .65f, .1f, .16f, 1, 0});
         }
     }
+    if (interactive) scene.push_back({static_cast<float>(bounds_.left), static_cast<float>(bounds_.top),
+        static_cast<float>(bounds_.width()), static_cast<float>(bounds_.height()), 0, 0, 0, 1.f / 255.f, 0});
 }
 }

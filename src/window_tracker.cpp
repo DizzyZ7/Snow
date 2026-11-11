@@ -195,9 +195,11 @@ struct WindowTracker::Impl {
         comInitialized = SUCCEEDED(initialized);
         // RPC_E_CHANGED_MODE means the caller already owns a different apartment.
         // CoCreateInstance remains best effort; cloaking is independently checked.
-        if (comInitialized || initialized == RPC_E_CHANGED_MODE)
-            CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER,
+        if (comInitialized || initialized == RPC_E_CHANGED_MODE) {
+            const HRESULT created = CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_INPROC_SERVER,
                 IID_PPV_ARGS(&virtualDesktop));
+            if (FAILED(created)) virtualDesktop = nullptr; // DWM cloaking remains the supported fallback.
+        }
         active = this;
         running = true;
         for (std::size_t index = 0; index < hooks.size(); ++index) {

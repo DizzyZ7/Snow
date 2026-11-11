@@ -16,6 +16,7 @@ param(
     [ValidateRange(1, 604800)][int]$DurationSeconds = 300,
     [ValidateRange(1, 60)][int]$IntervalSeconds = 5,
     [ValidateSet('gdi', 'd3d11')][string]$Renderer = 'gdi',
+    [Parameter(ParameterSetName = 'Launch')][switch]$Benchmark,
     [ValidateNotNullOrEmpty()][string]$OutputPath = 'snow-metrics.csv'
 )
 
@@ -24,13 +25,22 @@ $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'Measure-Snow requires Windows.' }
 
 # Compile before launching: even setup failures must not leave a new process behind.
-if (-not ('SnowProfiling.Native' -as [type])) {
+if (-not ('SnowProfilingV2.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
-namespace SnowProfiling {
+namespace SnowProfilingV2 {
+    public sealed class ControllerStats {
+        public uint State;
+        public uint Renderer;
+        public ulong Presents;
+        public uint IntervalMs;
+        public uint SuspendReasons;
+        public ulong StatsTickMs;
+        public string Status = "controller_not_found";
+    }
     public static class Native {
         private delegate bool EnumWindowsProc(IntPtr window, IntPtr argument);
         [DllImport("user32.dll", SetLastError = true)]
@@ -45,6 +55,54 @@ namespace SnowProfiling {
         private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", EntryPoint = "GetPropW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+        private static extern IntPtr GetProp(IntPtr window, string name);
+
+        public static ControllerStats GetControllerStats(uint expectedProcessId) {
+            var result = new ControllerStats();
+            if (IntPtr.Size != 8) { result.Status = "unsupported_32_bit_sampler"; return result; }
+            IntPtr controller = IntPtr.Zero;
+            int matches = 0;
+            EnumWindowsProc callback = delegate(IntPtr window, IntPtr unused) {
+                uint owner;
+                GetWindowThreadProcessId(window, out owner);
+                if (owner != expectedProcessId) return true;
+                var name = new StringBuilder(256);
+                if (GetClassName(window, name, name.Capacity) > 0 && name.ToString() == "SnowControllerV2") {
+                    controller = window;
+                    ++matches;
+                }
+                return true;
+            };
+            if (!EnumWindows(callback, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (matches == 0) return result;
+            if (matches != 1) { result.Status = "no_unique_controller"; return result; }
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                long before = GetProp(controller, "Snow.StatsTickMs").ToInt64();
+                long state = GetProp(controller, "Snow.State").ToInt64();
+                long renderer = GetProp(controller, "Snow.Renderer").ToInt64();
+                long interval = GetProp(controller, "Snow.IntervalMs").ToInt64();
+                ulong presents = unchecked((ulong)GetProp(controller, "Snow.Presents").ToInt64());
+                ulong reasons = unchecked((ulong)GetProp(controller, "Snow.SuspendReasons").ToInt64());
+                long after = GetProp(controller, "Snow.StatsTickMs").ToInt64();
+                if (before != after) continue;
+                // Positive protocol sentinels distinguish absent stats from legitimate zero counts/flags.
+                if (before <= 0 || (state != 1 && state != 2) || renderer < 1 || renderer > 3 || interval <= 0 || interval > uint.MaxValue || reasons > uint.MaxValue) {
+                    result.Status = "properties_unavailable_or_invalid";
+                    return result;
+                }
+                result.State = (uint)state;
+                result.Renderer = (uint)renderer;
+                result.IntervalMs = (uint)interval;
+                result.Presents = presents;
+                result.SuspendReasons = (uint)reasons;
+                result.StatsTickMs = (ulong)after;
+                result.Status = "available";
+                return result;
+            }
+            result.Status = "publication_changed_during_read";
+            return result;
+        }
 
         public static uint GuiCount(IntPtr process, uint flags) {
             ClearLastError(0);
@@ -75,6 +133,28 @@ namespace SnowProfiling {
     }
 }
 '@
+}
+
+function Get-SnowControllerStats {
+    param([int]$TargetId)
+    $snapshot = [pscustomobject]@{
+        State = $null; RendererActual = $null; TargetFps = $null; PresentCount = $null
+        StatsTickMs = $null; SuspendReasons = $null; Status = 'unavailable'
+    }
+    try {
+        $nativeStats = [SnowProfilingV2.Native]::GetControllerStats([uint32]$TargetId)
+        $snapshot.Status = $nativeStats.Status
+        if ($nativeStats.Status -eq 'available') {
+            $snapshot.State = if ($nativeStats.State -eq 1) { 'running' } else { 'paused' }
+            $snapshot.RendererActual = switch ($nativeStats.Renderer) { 1 { 'gdi' }; 2 { 'd3d11' }; 3 { 'mixed' } }
+            $snapshot.TargetFps = [Math]::Round(1000.0 / $nativeStats.IntervalMs, 6)
+            $snapshot.PresentCount = $nativeStats.Presents
+            $snapshot.StatsTickMs = $nativeStats.StatsTickMs
+            $snapshot.SuspendReasons = $nativeStats.SuspendReasons
+        }
+    }
+    catch { $snapshot.Status = "query_failed: $($_.Exception.Message)" }
+    return $snapshot
 }
 
 function Read-OptionalProcessValue {
@@ -137,7 +217,7 @@ function Stop-OwnedSnow {
             return
         }
         if ($Target.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) { throw 'Process identity changed; refusing to send WM_CLOSE.' }
-        [void][SnowProfiling.Native]::RequestClose([uint32]$Target.Id)
+        [void][SnowProfilingV2.Native]::RequestClose([uint32]$Target.Id)
         [void]$Target.WaitForExit([Math]::Min(1000, $IntervalSeconds * 1000))
     }
     $Target.Refresh()
@@ -175,7 +255,7 @@ try {
 catch { Write-Warning 'GPU adapter metadata is unavailable; individual sample status fields still report counter availability.' }
 
 $metadata = [ordered]@{
-    SchemaVersion = 1
+    SchemaVersion = 2
     Status = 'starting'
     Error = $null
     StartedUtc = [DateTime]::UtcNow.ToString('o')
@@ -183,6 +263,10 @@ $metadata = [ordered]@{
     RequestedDurationSeconds = $DurationSeconds
     RequestedIntervalSeconds = $IntervalSeconds
     Samples = 0
+    RunningStateSamples = 0
+    PausedStateSamples = 0
+    UnavailableStateSamples = 0
+    SamplesWithMeasuredPresentFps = 0
     ActualElapsedSeconds = 0
     ProcessId = $null
     ProcessStartTimeUtc = $null
@@ -191,7 +275,9 @@ $metadata = [ordered]@{
     Ownership = $PSCmdlet.ParameterSetName
     CleanupStatus = 'not_started'
     RendererRequested = $Renderer
-    RendererActual = 'not_verified; D3D11 can fall back to GDI'
+    RendererActual = $null
+    RenderersObserved = @()
+    BenchmarkRequested = if ($PSCmdlet.ParameterSetName -eq 'Launch') { [bool]$Benchmark } else { $null }
     LogicalProcessors = $logicalProcessors
     LogicalProcessorSource = $logicalProcessorSource
     OS = [Environment]::OSVersion.VersionString
@@ -207,7 +293,9 @@ $watch = $null
 $failure = $null
 try {
     if ($PSCmdlet.ParameterSetName -eq 'Launch') {
-        $target = Start-Process -FilePath $resolvedExe -WorkingDirectory ([System.IO.Path]::GetDirectoryName($resolvedExe)) -ArgumentList "--renderer=$Renderer" -PassThru
+        $launchArguments = @("--renderer=$Renderer")
+        if ($Benchmark) { $launchArguments += '--benchmark' }
+        $target = Start-Process -FilePath $resolvedExe -WorkingDirectory ([System.IO.Path]::GetDirectoryName($resolvedExe)) -ArgumentList $launchArguments -PassThru
         $owned = $true
     }
     else { $target = Get-Process -Id $ProcessId }
@@ -224,6 +312,7 @@ try {
     catch { Write-Warning 'Executable path/hash is unavailable for the attached process.' }
     $previousCpuSeconds = $target.TotalProcessorTime.TotalSeconds
     $previousElapsed = [double]0
+    $previousControllerStats = Get-SnowControllerStats $target.Id
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $nextSample = [double][Math]::Min($IntervalSeconds, $DurationSeconds)
     $metadata.Status = 'running'
@@ -246,8 +335,24 @@ try {
         $errors = New-Object 'System.Collections.Generic.List[string]'
         $privateBytes = Read-OptionalProcessValue { $target.PrivateMemorySize64 } 'PrivateBytes' $errors
         $workingSet = Read-OptionalProcessValue { $target.WorkingSet64 } 'WorkingSetBytes' $errors
-        $gdiObjects = Read-OptionalProcessValue { [SnowProfiling.Native]::GuiCount($target.Handle, 0) } 'GdiObjects' $errors
-        $userObjects = Read-OptionalProcessValue { [SnowProfiling.Native]::GuiCount($target.Handle, 1) } 'UserObjects' $errors
+        $gdiObjects = Read-OptionalProcessValue { [SnowProfilingV2.Native]::GuiCount($target.Handle, 0) } 'GdiObjects' $errors
+        $userObjects = Read-OptionalProcessValue { [SnowProfilingV2.Native]::GuiCount($target.Handle, 1) } 'UserObjects' $errors
+        $controllerStats = Get-SnowControllerStats $target.Id
+        $measuredPresentFps = $null
+        if ($controllerStats.Status -eq 'available' -and $previousControllerStats.Status -eq 'available' -and
+            $controllerStats.State -eq 'running' -and $previousControllerStats.State -eq 'running' -and
+            $controllerStats.SuspendReasons -eq 0 -and $previousControllerStats.SuspendReasons -eq 0 -and
+            $controllerStats.StatsTickMs -gt $previousControllerStats.StatsTickMs -and
+            $controllerStats.PresentCount -ge $previousControllerStats.PresentCount) {
+            $measuredPresentFps = [Math]::Round(1000.0 * ($controllerStats.PresentCount - $previousControllerStats.PresentCount) /
+                ($controllerStats.StatsTickMs - $previousControllerStats.StatsTickMs), 6)
+        }
+        if ($null -ne $controllerStats.RendererActual) {
+            if ($metadata.RenderersObserved -notcontains $controllerStats.RendererActual) {
+                $metadata.RenderersObserved += $controllerStats.RendererActual
+            }
+            $metadata.RendererActual = if ($metadata.RenderersObserved.Count -eq 1) { $metadata.RenderersObserved[0] } else { 'multiple_observed' }
+        }
         $privateWorkingSet = Get-PrivateWorkingSet $target.Id
         $gpuMemory = Get-GpuProcessMemory $target.Id
         $collection.Stop()
@@ -258,6 +363,15 @@ try {
             ProcessId = $target.Id
             ProcessStartTimeUtc = $metadata.ProcessStartTimeUtc
             RendererRequested = $Renderer
+            RendererActual = $controllerStats.RendererActual
+            BenchmarkRequested = $metadata.BenchmarkRequested
+            State = $controllerStats.State
+            TargetFps = $controllerStats.TargetFps
+            PresentCount = $controllerStats.PresentCount
+            MeasuredPresentFps = $measuredPresentFps
+            SuspendReasons = $controllerStats.SuspendReasons
+            StatsTickMs = $controllerStats.StatsTickMs
+            ControllerStatsStatus = $controllerStats.Status
             LogicalProcessors = $logicalProcessors
             CpuTotalSeconds = $cpuSeconds
             CpuPercentOfMachine = [Math]::Round(100.0 * $cpuDelta / $actualInterval / $logicalProcessors, 6)
@@ -277,8 +391,13 @@ try {
         if ($metadata.Samples -eq 0) { $row | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8 }
         else { $row | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8 -Append }
         ++$metadata.Samples
+        if ($controllerStats.State -eq 'running') { ++$metadata.RunningStateSamples }
+        elseif ($controllerStats.State -eq 'paused') { ++$metadata.PausedStateSamples }
+        else { ++$metadata.UnavailableStateSamples }
+        if ($null -ne $measuredPresentFps) { ++$metadata.SamplesWithMeasuredPresentFps }
         $previousCpuSeconds = $cpuSeconds
         $previousElapsed = $elapsed
+        $previousControllerStats = $controllerStats
         if ($elapsed -ge $DurationSeconds) { break }
         # Skip missed deadlines rather than inventing catch-up samples.
         do { $nextSample += $IntervalSeconds } while ($nextSample -le $watch.Elapsed.TotalSeconds)

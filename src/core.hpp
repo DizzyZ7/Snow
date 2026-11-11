@@ -70,7 +70,7 @@ public:
     void setPaused(bool paused) noexcept;
     void advance(double elapsedSeconds);
     bool useTool(Tool tool, float x, float y);
-    void buildScene(std::vector<DrawItem>& scene) const;
+    void buildScene(std::vector<DrawItem>& scene, bool interactive = false) const;
     [[nodiscard]] std::span<const Particle> particles() const noexcept { return {particles_.data(), count_}; }
     [[nodiscard]] std::span<const Decoration> decorations() const noexcept { return decorations_; }
     [[nodiscard]] SnowAccumulation& accumulation() noexcept { return accumulation_; }

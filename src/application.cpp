@@ -10,6 +10,7 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <chrono>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -87,17 +88,19 @@ struct Application::Impl {
     std::filesystem::path path;
     Clock::time_point lastFrame{Clock::now()}, lastInput{Clock::now()};
     Tool tool{Tool::None};
-    bool smoke{}, manualPause{}, sessionLocked{}, displayOff{}, powerSuspended{}, autoPause{}, battery{}, saver{}, running{}, frameTimer{}, writable{true}, shuttingDown{};
+    bool smoke{}, benchmark{}, manualPause{}, sessionLocked{}, displayOff{}, powerSuspended{}, autoPause{}, battery{}, saver{}, running{}, frameTimer{}, writable{true}, shuttingDown{};
     bool pauseHotkey{}, exitHotkey{}, escapeHotkey{}, sessionNotifications{}, policyPaused{true};
-    Rect desktopBounds{};
+    HFONT settingsFont{};
+    UINT settingsDpi{96};
     unsigned smokeStage{};
     std::uint64_t smokeSteps{};
     int result{}, interval{33};
 
-    Impl(HINSTANCE h, bool test, bool gpu) : instance(h), rendererKind(gpu ? RendererKind::D3D11 : RendererKind::Gdi), smoke(test) { overlays.reserve(16); scene.reserve(MaxDrawItems); }
+    Impl(HINSTANCE h, bool test, bool gpu, bool bench) : instance(h), rendererKind(gpu ? RendererKind::D3D11 : RendererKind::Gdi), smoke(test), benchmark(bench) { overlays.reserve(16); scene.reserve(MaxDrawItems); }
     ~Impl() {
         shutdown();
         if (controller) { SetWindowLongPtrW(controller, GWLP_USERDATA, 0); DestroyWindow(controller); }
+        if (settingsFont) DeleteObject(settingsFont);
         if (mutex) CloseHandle(mutex);
         if (smoke && !path.empty()) { std::error_code ec; std::filesystem::remove_all(path.parent_path(), ec); }
     }
@@ -107,18 +110,20 @@ struct Application::Impl {
         shuttingDown = true; running = false;
         if (controller) {
             KillTimer(controller, FrameTimer); KillTimer(controller, ReconcileTimer); KillTimer(controller, SmokeTimer); KillTimer(controller, TrackerTimer);
+            for (const wchar_t* key : {L"Snow.State", L"Snow.Renderer", L"Snow.Presents", L"Snow.IntervalMs", L"Snow.SuspendReasons", L"Snow.StatsTickMs"}) RemovePropW(controller, key);
             UnregisterHotKey(controller, PauseHotkey); UnregisterHotKey(controller, ExitHotkey); UnregisterHotKey(controller, EscapeHotkey);
             if (sessionNotifications) WTSUnRegisterSessionNotification(controller);
             if (displayNotification) { UnregisterPowerSettingNotification(displayNotification); displayNotification = nullptr; }
         }
         tracker.stop();
         if (settingsWindow) { DestroyWindow(settingsWindow); settingsWindow = nullptr; }
+        if (settingsFont) { DeleteObject(settingsFont); settingsFont = nullptr; }
         overlays.clear();
         if (tray.hWnd) { Shell_NotifyIconW(NIM_DELETE, &tray); tray.hWnd = nullptr; }
     }
     void fail() { result = 1; if (controller) PostMessageW(controller, WM_CLOSE, 0, 0); }
     void load() {
-        if (smoke) { path = std::filesystem::temp_directory_path() / (L"SnowSmoke-" + std::to_wstring(GetCurrentProcessId())) / L"settings.ini"; return; }
+        if (smoke) { path = std::filesystem::temp_directory_path() / (L"SnowSmoke-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())) / L"settings.ini"; return; }
         path = configPath();
         if (path.empty()) { writable = false; return; }
         std::error_code ec;
@@ -200,13 +205,29 @@ struct Application::Impl {
             if (!SetWindowPos(ov->hwnd, HWND_TOPMOST, rect.left, rect.top, rect.width(), rect.height(), SWP_NOACTIVATE | (paused() ? 0 : SWP_SHOWWINDOW))) return false;
             overlays.push_back(std::move(ov));
         }
-        desktopBounds = desktop; simulation.setBounds(desktop);
+        simulation.setBounds(desktop);
         return true;
+    }
+    void publishStats() noexcept {
+        if (!controller) return;
+        const auto put = [&](const wchar_t* key, std::uint64_t value) { SetPropW(controller, key, reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(value))); };
+        put(L"Snow.State", paused() ? 2 : 1);
+        unsigned renderer = 0;
+        for (const auto& ov : overlays) {
+            const unsigned kind = std::wcscmp(ov->renderer.name(), L"GDI alpha") == 0 ? 1U : 2U;
+            if (renderer && renderer != kind) { renderer = 3; break; }
+            renderer = kind;
+        }
+        put(L"Snow.Renderer", renderer);
+        put(L"Snow.Presents", overlays.empty() ? 0 : overlays.front()->renderer.presentCount());
+        put(L"Snow.IntervalMs", static_cast<std::uint64_t>(interval));
+        put(L"Snow.SuspendReasons", (manualPause ? 1U : 0U) | (sessionLocked ? 2U : 0U) | (displayOff ? 4U : 0U) | (powerSuspended ? 8U : 0U) | (autoPause ? 16U : 0U));
+        put(L"Snow.StatsTickMs", GetTickCount64());
     }
     void updatePolicy() {
         SYSTEM_POWER_STATUS power{};
         if (GetSystemPowerStatus(&power)) { battery = power.ACLineStatus == 0; saver = power.SystemStatusFlag != 0; }
-        if (!smoke) autoPause = tracker.foregroundFullscreen();
+        autoPause = !smoke && !benchmark && tracker.foregroundFullscreen();
         const bool stop = paused();
         if (stop != policyPaused) { simulation.setPaused(stop); lastFrame = Clock::now(); policyPaused = stop; }
         const int desired = performance.interval(settings.profile, battery, saver, systemLoad);
@@ -215,15 +236,10 @@ struct Application::Impl {
         if (!stop && !frameTimer) { frameTimer = SetTimer(controller, FrameTimer, static_cast<UINT>(interval), nullptr) != 0; if (!frameTimer) fail(); }
         for (const auto& ov : overlays) ShowWindow(ov->hwnd, stop ? SW_HIDE : SW_SHOWNOACTIVATE);
         if (stop && tool != Tool::None) setTool(Tool::None);
+        publishStats();
     }
     bool draw() {
-        simulation.buildScene(scene);
-        // A 1/255-alpha input plane gives layered windows a hit region between
-        // individual flakes only while the user explicitly activates a tool.
-        if (tool != Tool::None && scene.size() < MaxDrawItems) scene.push_back({
-            static_cast<float>(desktopBounds.left), static_cast<float>(desktopBounds.top),
-            static_cast<float>(desktopBounds.width()), static_cast<float>(desktopBounds.height()),
-            0, 0, 0, 1.f / 255.f, 0});
+        simulation.buildScene(scene, tool != Tool::None);
         for (const auto& ov : overlays) if (!ov->renderer.render(scene)) return false;
         return true;
     }
@@ -315,7 +331,7 @@ struct Application::Impl {
         const HWND hwnd = CreateWindowExW(0, klass, text, WS_CHILD | WS_VISIBLE | style,
             MulDiv(x, dpi, 96), MulDiv(y, dpi, 96), MulDiv(w, dpi, 96), MulDiv(h, dpi, 96),
             settingsWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance, nullptr);
-        if (hwnd) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        if (hwnd) SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(settingsFont ? settingsFont : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
         return hwnd;
     }
     void slider(const wchar_t* label, int y, int id, int min, int max, int value) {
@@ -325,6 +341,29 @@ struct Application::Impl {
         SendMessageW(hwnd, TBM_SETPOS, TRUE, value);
     }
     int position(int id) const { return static_cast<int>(SendDlgItemMessageW(settingsWindow, id, TBM_GETPOS, 0, 0)); }
+    void updateSettingsDpi(UINT dpi, bool scaleChildren) {
+        NONCLIENTMETRICSW metrics{}; metrics.cbSize = sizeof(metrics);
+        HFONT next = nullptr;
+        if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)) next = CreateFontIndirectW(&metrics.lfMessageFont);
+        struct Scaling { HWND parent; UINT before, after; HFONT font; bool scale; } scaling{settingsWindow, settingsDpi, dpi, next, scaleChildren};
+        EnumChildWindows(settingsWindow, [](HWND child, LPARAM value) -> BOOL {
+            auto& data = *reinterpret_cast<Scaling*>(value);
+            if (data.scale && data.before != data.after) {
+                RECT bounds{};
+                if (GetWindowRect(child, &bounds)) {
+                    MapWindowPoints(nullptr, data.parent, reinterpret_cast<POINT*>(&bounds), 2);
+                    SetWindowPos(child, nullptr, MulDiv(bounds.left, static_cast<int>(data.after), static_cast<int>(data.before)),
+                        MulDiv(bounds.top, static_cast<int>(data.after), static_cast<int>(data.before)),
+                        MulDiv(bounds.right - bounds.left, static_cast<int>(data.after), static_cast<int>(data.before)),
+                        MulDiv(bounds.bottom - bounds.top, static_cast<int>(data.after), static_cast<int>(data.before)), SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+            if (data.font) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(data.font), TRUE);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&scaling));
+        if (next) { if (settingsFont) DeleteObject(settingsFont); settingsFont = next; }
+        settingsDpi = dpi;
+    }
     void showSettings() {
         if (settingsWindow) { ShowWindow(settingsWindow, SW_SHOWNORMAL); SetForegroundWindow(settingsWindow); return; }
         setTool(Tool::None);
@@ -332,6 +371,7 @@ struct Application::Impl {
         settingsWindow = CreateWindowExW(WS_EX_CONTROLPARENT, SettingsClass, L"Snow — настройки", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT, CW_USEDEFAULT, MulDiv(430, dpi, 96), MulDiv(660, dpi, 96), nullptr, nullptr, instance, this);
         if (!settingsWindow) return;
+        updateSettingsDpi(GetDpiForWindow(settingsWindow), false);
         control(L"STATIC", L"Погода", 0, 20, 16, 170, 22, 0);
         const HWND weather = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 20, 40, 180, 180, WeatherControl);
         for (const wchar_t* name : {L"Легкий снег", L"Обычный снег", L"Сильный снег", L"Метель", L"Пользовательский"}) SendMessageW(weather, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
@@ -415,7 +455,7 @@ struct Application::Impl {
         if (msg == WM_NCCREATE) { self = static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams); SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self)); }
         if (self && msg == WM_COMMAND && LOWORD(wp) == ApplyControl) { self->applySettings(); return 0; }
         if (self && msg == WM_CLOSE) { self->settingsWindow = nullptr; DestroyWindow(hwnd); return 0; }
-        if (msg == WM_DPICHANGED) { const auto* r = reinterpret_cast<RECT*>(lp); SetWindowPos(hwnd, nullptr, r->left, r->top, r->right-r->left, r->bottom-r->top, SWP_NOZORDER | SWP_NOACTIVATE); return 0; }
+        if (self && msg == WM_DPICHANGED) { self->updateSettingsDpi(HIWORD(wp), true); const auto* r = reinterpret_cast<RECT*>(lp); SetWindowPos(hwnd, nullptr, r->left, r->top, r->right-r->left, r->bottom-r->top, SWP_NOZORDER | SWP_NOACTIVATE); return 0; }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     static LRESULT CALLBACK controllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) noexcept {
@@ -509,7 +549,7 @@ struct Application::Impl {
         return next == -1 ? 1 : static_cast<int>(message.wParam);
     }
 };
-Application::Application(HINSTANCE instance, bool smoke, bool gpu) : impl_(std::make_unique<Impl>(instance, smoke, gpu)) {}
+Application::Application(HINSTANCE instance, bool smoke, bool gpu, bool benchmark) : impl_(std::make_unique<Impl>(instance, smoke, gpu, benchmark)) {}
 Application::~Application() = default;
 int Application::run() { return impl_->run(); }
 }

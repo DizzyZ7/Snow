@@ -1,7 +1,7 @@
 # Local profiling and release artifacts
 
 Run these commands in a normal, interactive Windows 10/11 x64 user session using
-Windows PowerShell 5.1 or PowerShell 7. No administrator session is required. The
+64-bit Windows PowerShell 5.1 or PowerShell 7. No administrator session is required. The
 scripts write local files and do not upload data. Linux source inspection and
 hosted CI cannot establish real desktop, GPU, monitor, or long-duration results.
 
@@ -79,7 +79,11 @@ resolutions, scaling, session type, and whether the machine is on battery.
 Record settings before each run; starting Snow loads saved settings. Keep other
 workloads stable and capture any tray notification that reports GDI fallback.
 `RendererRequested` records the command-line request, not proof of the actual
-renderer: D3D11 may fall back to GDI. The metadata makes this limit explicit.
+renderer: D3D11 may fall back to GDI. `RendererActual` is read from the exact
+process's controller stats and records `gdi`, `d3d11`, or `mixed`; unavailable
+stats leave it empty. Metadata records the observed renderer set and uses
+`multiple_observed` if it changes during the run. It never infers a renderer
+from the request or from GPU memory values.
 
 These separate runs start a fresh process and sample every five seconds after
 the initial CPU baseline is read. Startup before that baseline is not measured.
@@ -107,6 +111,24 @@ results when a counter or process is unavailable.
 .\tools\Measure-Snow.ps1 -Exe .\build\Release\Snow.exe -Renderer d3d11 -DurationSeconds 28800 -OutputPath .\profiles\d3d11-8h.csv
 ```
 
+For an explicit continuous rendering workload, add `-Benchmark` in launch mode.
+This passes `--benchmark` to Snow and disables only its fullscreen automatic
+pause policy; manual pause, session lock, display-off and power suspension
+still apply. Metadata and CSV record `BenchmarkRequested`. Keep benchmark
+results separate from normal-policy desktop results. A benchmark flag alone
+does not prove active rendering: inspect `State`, `SuspendReasons` and measured
+submission rates. For example, a short CI collection check can use:
+
+```powershell
+.\tools\Measure-Snow.ps1 -Exe .\build\Release\Snow.exe -Renderer gdi -Benchmark -DurationSeconds 10 -IntervalSeconds 2 -OutputPath .\profiles\ci-gdi-benchmark.csv
+```
+
+Use the same explicit mode for all renderer comparisons and durations. Hosted
+runner fullscreen windows can automatically pause a normal launch, yielding
+low CPU and memory values that describe a paused process. Those values cannot
+establish active rendering performance. CI is still not an interactive desktop
+quality or long-duration performance verdict.
+
 Rename output paths for each repetition; existing CSV/metadata files cause an
 error. The default duration is 300 seconds, the default renderer is `gdi`, and
 `-IntervalSeconds` accepts 1 through 60. Short intervals increase observer cost.
@@ -117,7 +139,8 @@ providers can create gaps; do not interpret these gaps as continuous samples.
 Total wall-clock duration can exceed the requested duration by collection and
 graceful shutdown overhead. The `*.metadata.json` companion is always
 attempted, including failures; it records run outcome, environment, executable
-hash, sample count, requested interval and elapsed sampling time.
+hash, sample count, requested interval, elapsed sampling time, observed renderer
+set and counts of running, paused, unavailable-state and measured-rate samples.
 
 To attach without changing or terminating an existing process:
 
@@ -125,8 +148,11 @@ To attach without changing or terminating an existing process:
 .\tools\Measure-Snow.ps1 -ProcessId 1234 -Renderer gdi -DurationSeconds 300 -OutputPath .\profiles\attached-5m.csv
 ```
 
-The renderer label for an attached process is supplied by the caller. In launch
-mode, cleanup sends `WM_CLOSE` only to a `SnowControllerV2` window belonging to
+The requested renderer label for an attached process is supplied by the caller;
+actual renderer and state still come from its controller. `-Benchmark` is
+available only in launch mode. For an attached process, benchmark mode is
+unknown to the sampler and `BenchmarkRequested` is null. In launch mode,
+cleanup sends `WM_CLOSE` only to a `SnowControllerV2` window belonging to
 the process the script started and waits up to ten seconds for normal exit. A
 shutdown failure is reported as an error, with the still-running PID; no silent
 force-kill occurs. `Ctrl+C` attempts the same cleanup through `finally`. Closing
@@ -144,6 +170,14 @@ columns distinguish absent instances, missing properties and query failures.
 
 | CSV field | Source and meaning |
 | --- | --- |
+| `State` | Published controller state: `running` or `paused`; empty if unavailable. This is the latest published snapshot, not proof that the entire CPU interval was active. |
+| `RendererActual` | Published renderer: `gdi`, `d3d11`, or `mixed` across monitor renderers. It can differ from `RendererRequested`. |
+| `TargetFps` | `1000 / Snow.IntervalMs`: requested frame timer rate. It is not a measured rate. |
+| `PresentCount` | Published cumulative native submission count for the first monitor renderer, reset when that renderer is rebuilt. |
+| `MeasuredPresentFps` | `1000 * delta(PresentCount) / delta(StatsTickMs)` between consecutive available, running snapshots with no suspension flags and monotonic counters. This is observed first-monitor native submissions per second, not guaranteed compositor/display FPS or frame timing. Empty for paused/unavailable endpoints, nonadvancing publication time, or an observed counter reset. |
+| `SuspendReasons` | Published bit flags: manual pause `1`, session `2`, display `4`, power `8`, fullscreen `16`. Flags can be combined; zero is a valid published value. |
+| `StatsTickMs`, `ControllerStatsStatus` | Application publication time from `GetTickCount64`, plus stats availability/read status. The native properties update about every two seconds and on state changes, rather than per frame. An unchanged tick yields no measured rate. |
+| `BenchmarkRequested` | Whether the sampler launched with `--benchmark`; empty for attached processes. This changes only fullscreen-pause policy. |
 | `CpuPercentOfMachine` | Delta of `Process.TotalProcessorTime`, divided by actual monotonic interval and logical processor count, times 100. A fully occupied logical CPU is approximately `100 / LogicalProcessors` percent. |
 | `CpuTotalSeconds` | Cumulative user plus kernel process CPU time at the sampling point. |
 | `PrivateBytes` | `Process.PrivateMemorySize64`: process private committed memory, including nonresident pages. |
@@ -157,7 +191,21 @@ columns distinguish absent instances, missing properties and query failures.
 
 The metadata records whether logical processor count came from
 `Win32_ComputerSystem` or the count visible to PowerShell. The independent
-providers are not sampled atomically. GPU shared memory and process resident
+providers are not sampled atomically. Controller reads use the exact PID and
+`SnowControllerV2` class; positive state/renderer/interval/publication sentinels
+distinguish unavailable protocol data from valid zero counts and flags. A
+publication tick change during reading is retried. A 32-bit sampler leaves
+controller stats unavailable to avoid truncating 64-bit values. State changes
+or a renderer rebuild between polls can be missed: a reset is detected when
+the next observed count decreases, but a reset followed by enough submissions
+to exceed the earlier count cannot be identified from these counters alone.
+Two running endpoints also do not rule out a pause between them. Retain the
+event log and inspect publication times before classifying an interval as
+continuous active rendering. The CPU interval and submission-rate interval
+cover different clocks/publication boundaries and must not be treated as an
+atomic frame-level measurement.
+
+GPU shared memory and process resident
 memory can overlap; do not add process RAM and GPU bytes to claim a total RAM
 footprint. Per-process GPU memory may also include allocations shared by other
 processes; summing process totals is not adapter-wide usage. Some Windows 10
@@ -181,12 +229,19 @@ For a controlled paused comparison, attach or run a profile, note the exact
 UTC time, press `Ctrl+Alt+F11` to pause, leave it paused for a fixed interval,
 then press again to resume. Saved settings can affect background work, so keep
 them identical. CPU while paused must be judged over those marked intervals;
-the process still services tray/window/session events. Do not call a low GPU
-memory value evidence of a paused timer or zero CPU work.
+the process still services tray/window/session events. Confirm `State=paused`
+and the manual suspension flag, and report paused CPU separately from active
+CPU. A null submission rate while paused is intentional; it is not a measured
+zero. Do not call a low GPU memory value evidence of a paused timer or zero
+CPU work.
 
 Report sample count, missing metric count, first/last values, median/p95 CPU,
 peak private commit/working set/GPU values, and slopes over comparable settled
-intervals. Examine GDI/USER counts across repeated rebuilds and verify they
+intervals. Separate normal and benchmark runs, running and paused intervals,
+and each actual renderer; report unknown state/renderer counts explicitly.
+Include measured native submission-rate intervals and target rate separately.
+Do not classify a process-alive check or a paused sample as active performance.
+Examine GDI/USER counts across repeated rebuilds and verify they
 return to a repeatable baseline. Retain anomalous runs rather than replacing
 their values. Distinguish an observed growth trend from a confirmed leak and
 document the reproduction before drawing a conclusion. Do not turn arbitrary

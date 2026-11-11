@@ -41,6 +41,9 @@ Name: "startmenuicon"; Description: "Create a Start menu shortcut"; Flags: unche
 Source: "{#SnowSourceExe}"; DestDir: "{app}"; DestName: "Snow.exe"; Flags: ignoreversion
 Source: "{#SnowReadme}"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
 
+; Keep README's relative help links usable in the installed application folder.
+Source: "{#SourcePath}..\docs\*.md"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 [Icons]
 Name: "{userdesktop}\Snow"; Filename: "{app}\Snow.exe"; Tasks: desktopicon
 Name: "{userprograms}\Snow\Snow"; Filename: "{app}\Snow.exe"; Tasks: startmenuicon

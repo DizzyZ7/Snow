@@ -10,15 +10,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
-    bool smoke = false, gpu = false, valid = true;
+    bool smoke = false, gpu = false, benchmark = false, valid = true;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--smoke-test") == 0) smoke = true;
+        else if (std::wcscmp(argv[i], L"--benchmark") == 0) benchmark = true;
         else if (std::wcscmp(argv[i], L"--renderer=d3d11") == 0) gpu = true;
         else if (std::wcscmp(argv[i], L"--renderer=gdi") != 0) valid = false;
     }
     LocalFree(argv);
     if (!valid) return 2;
-    try { snow::Application app(instance, smoke, gpu); return app.run(); }
+    try { snow::Application app(instance, smoke, gpu, benchmark); return app.run(); }
     catch (const std::exception&) {
         if (!smoke) MessageBoxW(nullptr, L"Snow не удалось запустить. Проверьте доступность памяти и графического устройства.", L"Snow", MB_OK | MB_ICONERROR);
         return 1;

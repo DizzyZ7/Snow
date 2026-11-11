@@ -96,6 +96,7 @@ See README.md and docs/PROFILING.md in the source repository for validation step
     $notes | Set-Content -LiteralPath (Join-Path $stagedOutput $notesName) -Encoding UTF8
     Copy-Item -LiteralPath $resolvedExe -Destination (Join-Path $portable 'Snow.exe')
     Copy-Item -LiteralPath $readme -Destination (Join-Path $portable 'README.md')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'docs') -Destination (Join-Path $portable 'docs') -Recurse
     $notes | Set-Content -LiteralPath (Join-Path $portable 'RELEASE-NOTES.txt') -Encoding UTF8
     Compress-Archive -LiteralPath $portable -DestinationPath (Join-Path $stagedOutput $zipName) -CompressionLevel Optimal
 
