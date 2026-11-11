@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <random>
 #include <vector>
 
@@ -10,6 +11,9 @@ namespace {
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT ID_PAUSE = 1001;
 constexpr UINT ID_EXIT = 1002;
+constexpr UINT ID_LIGHT = 1003;
+constexpr UINT ID_NORMAL = 1004;
+constexpr UINT ID_BLIZZARD = 1005;
 constexpr UINT_PTR TIMER_ID = 1;
 struct Flake { float x, y, speed, drift, radius; };
 HWND overlay = nullptr;
@@ -21,6 +25,8 @@ std::mt19937 rng{std::random_device{}()};
 bool paused = false;
 UINT taskbarCreatedMessage = 0;
 unsigned tickCount = 0;
+int weatherMode = 1;
+std::chrono::steady_clock::time_point lastFrame = std::chrono::steady_clock::now();
 int width = 0, height = 0;
 HDC bufferDC = nullptr;
 HBITMAP bufferBitmap = nullptr;
@@ -63,7 +69,8 @@ void resizeDesktop() {
     std::uniform_real_distribution<float> px(0.f, static_cast<float>(width));
     std::uniform_real_distribution<float> py(0.f, static_cast<float>(height));
     flakes.clear();
-    const int count = std::clamp(width * height / 5500, 120, 1200);
+    const int divisor = weatherMode == 0 ? 15000 : weatherMode == 2 ? 2800 : 5500;
+    const int count = std::clamp(width * height / divisor, 60, 1800);
     for (int i = 0; i < count; ++i)
         flakes.push_back({px(rng), py(rng), 0, 0, 0});
     std::uniform_real_distribution<float> speed(25.f, 85.f);
@@ -78,6 +85,7 @@ void render() {
     FillRect(bufferDC, &bounds, black);
     // Color-key transparency: black is transparent; white flakes remain visible.
     HBRUSH snow = CreateSolidBrush(RGB(245, 248, 255));
+    if (!snow) return;
     HGDIOBJ oldBrush = SelectObject(bufferDC, snow);
     HGDIOBJ oldPen = SelectObject(bufferDC, GetStockObject(NULL_PEN));
     for (const auto& f : flakes) {
@@ -100,10 +108,13 @@ void render() {
 }
 void tick() {
     if (paused || width <= 0 || height <= 0) return;
-    constexpr float dt = 0.033f;
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::clamp(std::chrono::duration<float>(now - lastFrame).count(), 0.0f, 0.05f);
+    lastFrame = now;
+    const float wind = weatherMode == 2 ? 70.0f : 0.0f;
     for (auto& f : flakes) {
         f.y += f.speed * dt;
-        f.x += f.drift * dt;
+        f.x += (f.drift + wind) * dt;
         if (f.y > height + 5) f.y = -5;
         if (f.x < -5) f.x = static_cast<float>(width + 4);
         if (f.x > width + 5) f.x = -4;
@@ -115,6 +126,10 @@ void menu() {
     GetCursorPos(&p);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (paused ? MF_CHECKED : 0), ID_PAUSE, L"Пауза");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (weatherMode == 0 ? MF_CHECKED : 0), ID_LIGHT, L"Легкий снег");
+    AppendMenuW(m, MF_STRING | (weatherMode == 1 ? MF_CHECKED : 0), ID_NORMAL, L"Обычный снег");
+    AppendMenuW(m, MF_STRING | (weatherMode == 2 ? MF_CHECKED : 0), ID_BLIZZARD, L"Метель");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"Выход");
     SetForegroundWindow(controller);
@@ -131,7 +146,13 @@ LRESULT CALLBACK controllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU || lp == WM_LBUTTONUP) menu();
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wp) == ID_PAUSE) { paused = !paused; return 0; }
+        if (LOWORD(wp) == ID_PAUSE) { paused = !paused; lastFrame = std::chrono::steady_clock::now(); return 0; }
+        if (LOWORD(wp) >= ID_LIGHT && LOWORD(wp) <= ID_BLIZZARD) {
+            weatherMode = static_cast<int>(LOWORD(wp) - ID_LIGHT);
+            resizeDesktop();
+            render();
+            return 0;
+        }
         if (LOWORD(wp) == ID_EXIT) { DestroyWindow(hwnd); return 0; }
         break;
     case WM_DISPLAYCHANGE:
@@ -183,8 +204,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     ov.lpfnWndProc = overlayProc;
     ov.lpszClassName = L"SnowOverlay";
     if (!RegisterClassW(&ov)) return 1;
-    controller = CreateWindowExW(0, ctl.lpszClassName, L"Snow", 0, 0,0,0,0,
-                                 HWND_MESSAGE, nullptr, instance, nullptr);
+    // A hidden top-level window receives Explorer's TaskbarCreated broadcast.
+    controller = CreateWindowExW(WS_EX_TOOLWINDOW, ctl.lpszClassName, L"Snow", WS_POPUP,
+                                 0,0,0,0, nullptr, nullptr, instance, nullptr);
     if (!controller) return 1;
     overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE |
                               WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -203,7 +225,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
     resizeDesktop();
-    SetTimer(controller, TIMER_ID, 33, nullptr);
+    render();
+    if (!SetTimer(controller, TIMER_ID, 33, nullptr)) {
+        DestroyWindow(controller);
+        return 1;
+    }
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
