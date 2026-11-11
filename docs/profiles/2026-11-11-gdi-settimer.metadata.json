@@ -1,0 +1,39 @@
+{
+  "SchemaVersion": 2,
+  "Status": "complete",
+  "Error": null,
+  "StartedUtc": "2026-11-11T16:51:49.7257442Z",
+  "FinishedUtc": "2026-11-11T16:52:09.9196494Z",
+  "RequestedDurationSeconds": 20,
+  "RequestedIntervalSeconds": 3,
+  "Samples": 7,
+  "RunningStateSamples": 7,
+  "PausedStateSamples": 0,
+  "UnavailableStateSamples": 0,
+  "SamplesWithMeasuredPresentFps": 7,
+  "ActualElapsedSeconds": 20.0373453,
+  "ProcessId": 5832,
+  "ProcessStartTimeUtc": "2026-11-11T16:51:49.7675189Z",
+  "Executable": "D:\\a\\Snow\\Snow\\build\\Release\\Snow.exe",
+  "ExecutableSha256": "d0006d0a8a2dd7c2b2849b4458cdcc2c7217a412aff3d55fe3a54050f30da922",
+  "Ownership": "Launch",
+  "CleanupStatus": "exited_normally",
+  "RendererRequested": "gdi",
+  "RendererActual": "gdi",
+  "RenderersObserved": [
+    "gdi"
+  ],
+  "BenchmarkRequested": true,
+  "LogicalProcessors": 4,
+  "LogicalProcessorSource": "Win32_ComputerSystem.NumberOfLogicalProcessors",
+  "OS": "Microsoft Windows NT 10.0.20348.0",
+  "PowerShellVersion": "7.6.9",
+  "Is64BitSampler": true,
+  "GpuAdapters": [
+    {
+      "Name": "Microsoft Hyper-V Video",
+      "DriverVersion": "10.0.20348.1"
+    }
+  ],
+  "CsvPath": "D:\\a\\Snow\\Snow\\build\\gdi-runner-metrics.csv"
+}

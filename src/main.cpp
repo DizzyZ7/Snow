@@ -3,7 +3,7 @@
 #include <cwchar>
 #include <exception>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int) {
     // The embedded manifest is authoritative; an already-set awareness returns
     // access denied here and must not be downgraded by a legacy API fallback.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);

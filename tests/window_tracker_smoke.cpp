@@ -150,15 +150,16 @@ struct HelperProcess {
     std::wstring title;
     HWND window() const { return FindWindowW(HelperClass, title.c_str()); }
     HelperProcess() {
-        wchar_t executable[32768]{};
-        const DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
-        require(length != 0 && length < std::size(executable), "find smoke executable");
+        std::wstring executable(32768, L'\0');
+        const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        require(length != 0 && length < executable.size(), "find smoke executable");
+        executable.resize(length);
         title = L"Snow tracker smoke " + std::to_wstring(GetCurrentProcessId()) + L"-" +
             std::to_wstring(GetTickCount64());
         std::wstring command = L"\"" + std::wstring(executable) + L"\" --helper \"" + title + L"\"";
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
-        require(CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE, 0,
+        require(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
             nullptr, nullptr, &startup, &process) != FALSE, "start helper process");
     }
     ~HelperProcess() {

@@ -81,7 +81,7 @@ bool exerciseRenderer(snow::RendererKind kind, bool optionalCapability, bool& sk
                      "normal overlays must be layered, click-through and nonactivating");
     {
         Window window(snow::Renderer::windowStyles(kind));
-        if (!expect(window.hwnd != nullptr, "create overlay")) return false;
+        if (!window.hwnd) return expect(false, "create overlay");
         snow::Renderer renderer;
         if (!renderer.initialize(window.hwnd, {24, 24, 152, 120}, kind)) {
             if (optionalCapability) {
@@ -123,7 +123,7 @@ bool exerciseRenderer(snow::RendererKind kind, bool optionalCapability, bool& sk
                 break;
             }
             RECT positioned{};
-            ok = expect(GetWindowRect(window.hwnd, &positioned) != FALSE &&
+            ok = expect(window.hwnd != nullptr && GetWindowRect(window.hwnd, &positioned) != FALSE &&
                         positioned.left == monitor.left && positioned.top == monitor.top &&
                         positioned.right == monitor.right && positioned.bottom == monitor.bottom,
                         "resized window preserves absolute negative monitor coordinates") && ok;
@@ -198,7 +198,7 @@ bool visualAlpha(snow::RendererKind kind) {
     pumpMessages();
     if (!expect(SUCCEEDED(DwmFlush()), "wait for composited visual fixture")) return false;
     HDC screen = GetDC(nullptr);
-    if (!expect(screen != nullptr, "capture composited display")) return false;
+    if (!screen) return expect(false, "capture composited display");
     const COLORREF blended = GetPixel(screen, x + 32, y + 32);
     const COLORREF clear = GetPixel(screen, x + 80, y + 80);
     ReleaseDC(nullptr, screen);

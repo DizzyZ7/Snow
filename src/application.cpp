@@ -20,7 +20,7 @@
 namespace snow {
 namespace {
 constexpr UINT TrayMessage = WM_APP + 1, TrackerMessage = WM_APP + 2;
-constexpr UINT_PTR FrameTimer = 1, ReconcileTimer = 2, SmokeTimer = 3, TrackerTimer = 4;
+constexpr UINT_PTR ReconcileTimer = 2, SmokeTimer = 3, TrackerTimer = 4;
 constexpr int PauseId = 1001, ExitId = 1002, SettingsId = 1003, ClearId = 1004;
 constexpr int WeatherId = 1100, ProfileId = 1200, ToolId = 1300;
 constexpr int PauseHotkey = 1, ExitHotkey = 2, EscapeHotkey = 3;
@@ -72,7 +72,7 @@ struct Application::Impl {
     };
     HINSTANCE instance{};
     HWND controller{}, settingsWindow{};
-    HANDLE mutex{};
+    HANDLE mutex{}, frameClock{};
     NOTIFYICONDATAW tray{};
     UINT taskbarMessage{};
     std::vector<std::unique_ptr<Overlay>> overlays;
@@ -101,6 +101,7 @@ struct Application::Impl {
         shutdown();
         if (controller) { SetWindowLongPtrW(controller, GWLP_USERDATA, 0); DestroyWindow(controller); }
         if (settingsFont) DeleteObject(settingsFont);
+        if (frameClock) CloseHandle(frameClock);
         if (mutex) CloseHandle(mutex);
         if (smoke && !path.empty()) { std::error_code ec; std::filesystem::remove_all(path.parent_path(), ec); }
     }
@@ -109,7 +110,9 @@ struct Application::Impl {
         if (shuttingDown) return;
         shuttingDown = true; running = false;
         if (controller) {
-            KillTimer(controller, FrameTimer); KillTimer(controller, ReconcileTimer); KillTimer(controller, SmokeTimer); KillTimer(controller, TrackerTimer);
+            if (frameClock) CancelWaitableTimer(frameClock);
+            frameTimer = false;
+            KillTimer(controller, ReconcileTimer); KillTimer(controller, SmokeTimer); KillTimer(controller, TrackerTimer);
             for (const wchar_t* key : {L"Snow.State", L"Snow.Renderer", L"Snow.Presents", L"Snow.IntervalMs", L"Snow.SuspendReasons", L"Snow.StatsTickMs"}) RemovePropW(controller, key);
             UnregisterHotKey(controller, PauseHotkey); UnregisterHotKey(controller, ExitHotkey); UnregisterHotKey(controller, EscapeHotkey);
             if (sessionNotifications) WTSUnRegisterSessionNotification(controller);
@@ -224,6 +227,11 @@ struct Application::Impl {
         put(L"Snow.SuspendReasons", (manualPause ? 1U : 0U) | (sessionLocked ? 2U : 0U) | (displayOff ? 4U : 0U) | (powerSuspended ? 8U : 0U) | (autoPause ? 16U : 0U));
         put(L"Snow.StatsTickMs", GetTickCount64());
     }
+    bool armFrameClock(int milliseconds) noexcept {
+        if (!frameClock) return false;
+        LARGE_INTEGER due{}; due.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000;
+        return SetWaitableTimerEx(frameClock, &due, milliseconds, nullptr, nullptr, nullptr, 0) != 0;
+    }
     void updatePolicy() {
         SYSTEM_POWER_STATUS power{};
         if (GetSystemPowerStatus(&power)) { battery = power.ACLineStatus == 0; saver = power.SystemStatusFlag != 0; }
@@ -231,9 +239,9 @@ struct Application::Impl {
         const bool stop = paused();
         if (stop != policyPaused) { simulation.setPaused(stop); lastFrame = Clock::now(); policyPaused = stop; }
         const int desired = performance.interval(settings.profile, battery, saver, systemLoad);
-        if (frameTimer && (stop || interval != desired)) { KillTimer(controller, FrameTimer); frameTimer = false; }
+        if (frameTimer && (stop || interval != desired)) { CancelWaitableTimer(frameClock); frameTimer = false; }
         interval = desired;
-        if (!stop && !frameTimer) { frameTimer = SetTimer(controller, FrameTimer, static_cast<UINT>(interval), nullptr) != 0; if (!frameTimer) fail(); }
+        if (!stop && !frameTimer) { frameTimer = armFrameClock(interval); if (!frameTimer) fail(); }
         for (const auto& ov : overlays) ShowWindow(ov->hwnd, stop ? SW_HIDE : SW_SHOWNOACTIVATE);
         if (stop && tool != Tool::None) setTool(Tool::None);
         publishStats();
@@ -255,8 +263,8 @@ struct Application::Impl {
         performance.recordFrame(std::chrono::duration<double>(Clock::now() - now).count());
         const int desired = performance.interval(settings.profile, battery, saver, systemLoad);
         if (frameTimer && desired != interval) {
-            KillTimer(controller, FrameTimer); interval = desired;
-            frameTimer = SetTimer(controller, FrameTimer, static_cast<UINT>(interval), nullptr) != 0;
+            CancelWaitableTimer(frameClock); interval = desired;
+            frameTimer = armFrameClock(interval);
             if (!frameTimer) fail();
         }
         if (tool != Tool::None && now - lastInput > std::chrono::seconds(30)) setTool(Tool::None);
@@ -477,8 +485,7 @@ struct Application::Impl {
             if (LOWORD(lp) == WM_CONTEXTMENU || LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT) self->menu();
             return 0;
         case WM_TIMER:
-            if (wp == FrameTimer) self->frame();
-            else if (wp == ReconcileTimer) self->reconcile();
+            if (wp == ReconcileTimer) self->reconcile();
             else if (wp == SmokeTimer) self->smokeTick();
             else if (wp == TrackerTimer) { KillTimer(hwnd, TrackerTimer); self->simulation.accumulation().reconcile(self->tracker.refresh()); self->updatePolicy(); }
             return 0;
@@ -517,6 +524,9 @@ struct Application::Impl {
             if (!mutex) return 1;
             if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
         }
+        frameClock = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!frameClock) frameClock = CreateWaitableTimerW(nullptr, FALSE, nullptr); // Windows 10 before 1803.
+        if (!frameClock) return 1;
         const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
         struct ComGuard { Impl* self; HRESULT hr; ~ComGuard() { self->shutdown(); if (SUCCEEDED(hr)) CoUninitialize(); } } guard{this, com};
         INITCOMMONCONTROLSEX common{sizeof(common), ICC_BAR_CLASSES}; if (!InitCommonControlsEx(&common)) return 1;
@@ -541,12 +551,21 @@ struct Application::Impl {
         running = true; updatePolicy();
         if (!SetTimer(controller, ReconcileTimer, 2000, nullptr) || (smoke && !SetTimer(controller, SmokeTimer, 700, nullptr))) return 1;
         if (!smoke && (!pauseHotkey || !exitHotkey)) balloon(L"Горячая клавиша занята", L"Некоторые сочетания недоступны. Пауза и выход доступны в меню трея.");
-        MSG message{}; BOOL next;
-        while ((next = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-            if (settingsWindow && IsDialogMessageW(settingsWindow, &message)) continue;
-            TranslateMessage(&message); DispatchMessageW(&message);
+        MSG message{};
+        for (;;) {
+            // Drain UI messages before the frame clock so slow rendering cannot
+            // starve tray commands, Escape or shutdown. The wait blocks in kernel.
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT) return static_cast<int>(message.wParam);
+                if (settingsWindow && IsDialogMessageW(settingsWindow, &message)) continue;
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+            const DWORD handles = frameTimer ? 1U : 0U;
+            const DWORD ready = MsgWaitForMultipleObjectsEx(handles, handles ? &frameClock : nullptr,
+                INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (ready == WAIT_FAILED) return 1;
+            if (handles && ready == WAIT_OBJECT_0) frame();
         }
-        return next == -1 ? 1 : static_cast<int>(message.wParam);
     }
 };
 Application::Application(HINSTANCE instance, bool smoke, bool gpu, bool benchmark) : impl_(std::make_unique<Impl>(instance, smoke, gpu, benchmark)) {}

@@ -24,3 +24,13 @@ Results are appended only after commands run. Desktop Win10/11, hardware GPU, mu
 ### Initial resource sample — state unknown, not active-performance evidence
 
 Five real 3-second samples on Windows Server 2022 / Hyper-V Video / 4 logical CPUs: private commit 6,922,240 bytes; Working Set 21,839,872; private Working Set 5,140,480; 2 GDI / 15 USER objects. GPU counters had no process instance and are unavailable, not zero. CPU samples were zero, but the app may have auto-paused behind the runner's fullscreen window. These values are therefore NOT normal-mode target verification and are NOT an optimization comparison. The sampler now records actual state/renderer/native submissions; explicit `--benchmark` disables only fullscreen auto-pause for reproducible CI workload.
+
+## Second integrated Windows run (579ca2b)
+
+- Run 43062327292: Release and Debug x64 each passed all SIX CTests, including composited alpha pixel checks and D3D11 lifecycle (not skipped). Native GDI alpha over a blue backdrop was measured, not inferred from successful API return values.
+- Windows MSVC AddressSanitizer passed all native CTests after staging its runtime DLL. Linux run 43062327143 passed sanitizer/leak checks.
+- Portable and installer built; silent per-user installation, installed Snow lifecycle and silent uninstall all passed.
+- Static analyzer progressed to three additional test/entry-point warnings: potential null HWND at GetWindowRect (C6387), 65KB test path array on stack (C6262), missing wWinMain SAL annotations (C28251). The tests now use direct null guards and heap-backed path storage; entry-point annotations match the SDK. A new run must confirm these changes.
+- Active GDI benchmark: seven samples over 20.037s, all running, no suspension flags, actual renderer GDI. Private Bytes/Commit 6,586,368 bytes; Working Set 20,930,560; private Working Set 4,907,008; GDI/USER counts 2/15 throughout. GPU counters unavailable. CPU time counter did not increase over this short sample; no reliable steady-state CPU percentage is inferred from that.
+- Measured native submissions: 21–21.5/sec versus target 30.303. This exposed message-timer pacing granularity. The frame clock now uses a high-resolution waitable timer when supported, regular waitable fallback on early Windows 10, and MsgWaitForMultipleObjectsEx. No spin loop or timeBeginPeriod call. New runtime/pacing measurements are required before declaring the change verified.
+- Raw active samples: docs/profiles/2026-11-11-gdi-settimer.csv and its metadata. These Windows Server/Hyper-V measurements do not establish Windows 10/11 hardware GPU, multi-DPI or 8-hour stability.
