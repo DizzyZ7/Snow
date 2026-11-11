@@ -19,14 +19,16 @@ RECT desktop{};
 std::vector<Flake> flakes;
 std::mt19937 rng{std::random_device{}()};
 bool paused = false;
+UINT taskbarCreatedMessage = 0;
+unsigned tickCount = 0;
 int width = 0, height = 0;
 HDC bufferDC = nullptr;
 HBITMAP bufferBitmap = nullptr;
 HGDIOBJ previousBitmap = nullptr;
 void releaseBuffer() {
     if (bufferDC) {
-        SelectObject(bufferDC, previousBitmap);
-        DeleteObject(bufferBitmap);
+        if (previousBitmap) SelectObject(bufferDC, previousBitmap);
+        if (bufferBitmap) DeleteObject(bufferBitmap);
         DeleteDC(bufferDC);
     }
     bufferDC = nullptr;
@@ -120,6 +122,10 @@ void menu() {
     DestroyMenu(m);
 }
 LRESULT CALLBACK controllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (taskbarCreatedMessage && msg == taskbarCreatedMessage) {
+        Shell_NotifyIconW(NIM_ADD, &tray);
+        return 0;
+    }
     switch (msg) {
     case WM_TRAY:
         if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU || lp == WM_LBUTTONUP) menu();
@@ -133,7 +139,19 @@ LRESULT CALLBACK controllerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         resizeDesktop();
         return 0;
     case WM_TIMER:
-        if (wp == TIMER_ID) tick();
+        if (wp == TIMER_ID) {
+            // Message-only windows do not reliably receive desktop broadcast messages.
+            // Reconcile virtual desktop geometry periodically for monitor changes.
+            if (++tickCount % 60 == 0) {
+                const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                const int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                const int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                if (left != desktop.left || top != desktop.top || w != width || h != height)
+                    resizeDesktop();
+            }
+            tick();
+        }
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_ID);
@@ -152,7 +170,9 @@ LRESULT CALLBACK overlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 }
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
-    SetProcessDPIAware();
+    if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+        SetProcessDPIAware();
+    taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSW ctl{};
     ctl.hInstance = instance;
     ctl.lpfnWndProc = controllerProc;
