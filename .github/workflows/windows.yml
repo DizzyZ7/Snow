@@ -11,6 +11,19 @@ jobs:
         run: cmake -S . -B build -A x64
       - name: Build
         run: cmake --build build --config Release
+      - name: Smoke test process startup
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'build/Release/Snow.exe'
+          $process = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 3
+            $process.Refresh()
+            if ($process.HasExited) { throw "Snow exited unexpectedly with code $($process.ExitCode)" }
+            Write-Host 'Snow process started and remained alive for 3 seconds.'
+          } finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+          }
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
