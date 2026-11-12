@@ -24,10 +24,10 @@ jobs:
         run: cmake --build build --config ${{ matrix.config }} --parallel
       - name: Test real native lifecycle and portable model
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
-      - name: Short resource sample (hosted runner, not a performance gate)
+      - name: 5-minute active GDI profile (hosted runner)
         if: matrix.config == 'Release'
         shell: pwsh
-        run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -DurationSeconds 20 -IntervalSeconds 3 -Benchmark -OutputPath build/gdi-runner-metrics.csv
+        run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -DurationSeconds 300 -IntervalSeconds 15 -Benchmark -OutputPath build/gdi-runner-metrics.csv
       - name: GPU candidate comparison (same hosted runner)
         if: matrix.config == 'Release'
         shell: pwsh
