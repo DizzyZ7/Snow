@@ -1,0 +1,21 @@
+name: Portable core sanitizers
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: core-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure address and undefined behavior sanitizers
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSNOW_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test including leak checks
+        run: ctest --test-dir build --output-on-failure

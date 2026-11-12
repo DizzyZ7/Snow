@@ -1,0 +1,72 @@
+name: Windows build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: snow-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release, Debug]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure x64
+        run: cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+      - name: Build with warnings as errors
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+      - name: Test real native lifecycle and portable model
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+      - name: 5-minute active GDI profile (hosted runner)
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -DurationSeconds 300 -IntervalSeconds 15 -Benchmark -OutputPath build/gdi-runner-metrics.csv
+      - name: GPU candidate comparison (same hosted runner)
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -Renderer d3d11 -DurationSeconds 20 -IntervalSeconds 3 -Benchmark -OutputPath build/d3d11-runner-metrics.csv
+      - name: Portable and per-user installer
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: ./tools/Package-Snow.ps1 -Exe build/Release/Snow.exe -Version 0.3.0 -OutputDirectory build/package -RequireInstaller
+      - name: Install, exercise and uninstall the preview
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: ./tests/installer_smoke.ps1 -Setup build/package/Snow-0.3.0-windows-x64-setup.exe
+      - name: Upload preview build and evidence
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Snow-Windows-x64-preview
+          path: |
+            build/Release/Snow.exe
+            build/package/*
+            build/*metrics.csv
+            build/*metrics.metadata.json
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: error
+  address-sanitizer:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure MSVC AddressSanitizer
+        run: cmake -S . -B build-asan -A x64 -DSNOW_SANITIZERS=ON -DBUILD_TESTING=ON
+      - name: Build with AddressSanitizer
+        run: cmake --build build-asan --config RelWithDebInfo --parallel
+      - name: Test with AddressSanitizer
+        run: ctest --test-dir build-asan -C RelWithDebInfo --output-on-failure
+  static-analysis:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Configure MSVC native analysis
+        run: cmake -S . -B build-analysis -A x64 -DSNOW_ANALYZE=ON -DBUILD_TESTING=ON
+      - name: Analyze with warnings as errors
+        run: cmake --build build-analysis --config Release --parallel
