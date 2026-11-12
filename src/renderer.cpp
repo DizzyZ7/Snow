@@ -35,11 +35,13 @@ bool dimensions(Rect monitor, int& width, int& height) noexcept {
     return true;
 }
 
+enum class Primitive : unsigned char { Rectangle = 0, Ellipse = 1, Crystal = 2 };
+
 struct PreparedItem {
     double left{}, top{}, right{}, bottom{};
     double clippedLeft{}, clippedTop{}, clippedRight{}, clippedBottom{};
     float r{}, g{}, b{}, a{};
-    bool ellipse{};
+    Primitive primitive{Primitive::Rectangle};
 };
 
 bool prepare(const DrawItem& item, Rect monitor, PreparedItem& out) noexcept {
@@ -49,6 +51,10 @@ bool prepare(const DrawItem& item, Rect monitor, PreparedItem& out) noexcept {
         !std::isfinite(item.b) || !std::isfinite(item.a) ||
         !std::isfinite(item.shape) || item.w <= 0 || item.h <= 0 || item.a <= 0)
         return false;
+    if (item.shape == 0.0F) out.primitive = Primitive::Rectangle;
+    else if (item.shape == 1.0F) out.primitive = Primitive::Ellipse;
+    else if (item.shape == 2.0F) out.primitive = Primitive::Crystal;
+    else return false;
     out.left = static_cast<double>(item.x) - monitor.left;
     out.top = static_cast<double>(item.y) - monitor.top;
     out.right = out.left + static_cast<double>(item.w);
@@ -64,8 +70,35 @@ bool prepare(const DrawItem& item, Rect monitor, PreparedItem& out) noexcept {
     out.g = std::clamp(item.g, 0.0F, 1.0F);
     out.b = std::clamp(item.b, 0.0F, 1.0F);
     out.a = std::clamp(item.a, 0.0F, 1.0F);
-    out.ellipse = item.shape >= 0.5F;
     return true;
+}
+
+double branchDistance(double along, double across, double start, double end, double reach) noexcept {
+    const double length = end - start;
+    const double projection = std::clamp(((along - start) * length + across * reach) /
+                                        (length * length + reach * reach), 0.0, 1.0);
+    const double dy = along - start - projection * length;
+    const double dx = across - projection * reach;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// Original procedural crystal: six fine spines, paired branch tiers and a
+// faceted central hub. Fold into the nearest arm's 60-degree sector using dot
+// products; no trigonometry, lookup image or per-pixel allocation is needed.
+// Coordinates and stroke distances are normalized to the quad's half-extents.
+double crystalDistance(double x, double y) noexcept {
+    constexpr double cos30 = 0.8660254037844386;
+    x = std::abs(x);
+    y = std::abs(y);
+    const double diagonal = cos30 * x + 0.5 * y;
+    const double along = (std::max)(y, diagonal);
+    const double across = diagonal > y ? std::abs(0.5 * x - cos30 * y) : x;
+    const double tip = (std::max)(along - 0.90, 0.0);
+    const double spine = std::sqrt(across * across + tip * tip) - 0.070;
+    const double innerBranch = branchDistance(along, across, 0.38, 0.59, 0.18) - 0.045;
+    const double outerBranch = branchDistance(along, across, 0.63, 0.80, 0.13) - 0.032;
+    const double hub = along - 0.12;
+    return (std::min)((std::min)(spine, hub), (std::min)(innerBranch, outerBranch));
 }
 
 struct GdiSurface {
@@ -147,6 +180,7 @@ void rasterize(GdiSurface& target, const PreparedItem& item) noexcept {
     const double radiusY = (item.bottom - item.top) * 0.5;
     const double centerX = item.left + radiusX;
     const double centerY = item.top + radiusY;
+    const double crystalPixelScale = (std::min)(radiusX, radiusY);
     for (int y = top; y < bottom; ++y) {
         auto* row = target.pixels + static_cast<std::size_t>(y) * static_cast<std::size_t>(target.width);
         const double vertical = (std::min)(static_cast<double>(y + 1), item.bottom) -
@@ -155,7 +189,7 @@ void rasterize(GdiSurface& target, const PreparedItem& item) noexcept {
             const double horizontal = (std::min)(static_cast<double>(x + 1), item.right) -
                                       (std::max)(static_cast<double>(x), item.left);
             double coverage = horizontal * vertical;
-            if (item.ellipse) {
+            if (item.primitive == Primitive::Ellipse) {
                 const double qx = (static_cast<double>(x) + 0.5 - centerX) / radiusX;
                 const double qy = (static_cast<double>(y) + 0.5 - centerY) / radiusY;
                 const double distance = std::sqrt(qx * qx + qy * qy);
@@ -165,6 +199,12 @@ void rasterize(GdiSurface& target, const PreparedItem& item) noexcept {
                     ? std::clamp((1.0 - distance) * distance / gradient + 0.5, 0.0, 1.0)
                     : 1.0;
                 coverage = (std::min)(coverage, ellipseCoverage);
+            } else if (item.primitive == Primitive::Crystal) {
+                const double qx = (static_cast<double>(x) + 0.5 - centerX) / radiusX;
+                const double qy = (static_cast<double>(y) + 0.5 - centerY) / radiusY;
+                const double crystalCoverage = std::clamp(
+                    0.5 - crystalDistance(qx, qy) * crystalPixelScale, 0.0, 1.0);
+                coverage = (std::min)(coverage, crystalCoverage);
             }
             blendPixel(row[x], item, coverage);
         }
@@ -200,12 +240,37 @@ PixelInput VSMain(VertexInput input, uint vertex : SV_VertexID) {
     output.shape = input.shape;
     return output;
 }
+float branchDistance(float2 p, float start, float end, float reach) {
+    float2 branch = float2(end - start, reach);
+    float2 local = p - float2(start, 0.0);
+    float projection = saturate(dot(local, branch) / dot(branch, branch));
+    return length(local - projection * branch);
+}
+float crystalDistance(float2 p) {
+    const float cos30 = 0.8660254037844386;
+    p = abs(p);
+    float diagonal = dot(p, float2(cos30, 0.5));
+    float along = max(p.y, diagonal);
+    float across = diagonal > p.y ? abs(0.5 * p.x - cos30 * p.y) : p.x;
+    float tip = max(along - 0.90, 0.0);
+    float spine = length(float2(across, tip)) - 0.070;
+    float innerBranch = branchDistance(float2(along, across), 0.38, 0.59, 0.18) - 0.045;
+    float outerBranch = branchDistance(float2(along, across), 0.63, 0.80, 0.13) - 0.032;
+    return min(min(spine, along - 0.12), min(innerBranch, outerBranch));
+}
 float4 PSMain(PixelInput input) : SV_TARGET {
     float coverage = 1.0;
-    if (input.shape > 0.5) {
+    if (input.shape == 1.0) {
         float distance = length(input.uv * 2.0 - 1.0);
         float antialiasWidth = max(fwidth(distance), 0.00001);
         coverage = saturate((1.0 - distance) / antialiasWidth + 0.5);
+    } else if (input.shape == 2.0) {
+        float2 p = input.uv * 2.0 - 1.0;
+        float2 pixelSpan = fwidth(p);
+        // Original UV derivatives survive monitor clipping; use the shorter
+        // half-extent as in the CPU path, preserving a one-pixel AA transition.
+        float normalizedPixel = max(max(pixelSpan.x, pixelSpan.y), 1.0e-30);
+        coverage = saturate(0.5 - crystalDistance(p) / normalizedPixel);
     }
     float alpha = input.color.a * coverage;
     return float4(input.color.rgb * alpha, alpha);
@@ -361,7 +426,7 @@ struct D3dResources {
                            static_cast<float>((prepared.clippedRight - prepared.left) / itemWidth),
                            static_cast<float>((prepared.clippedBottom - prepared.top) / itemHeight)};
             instance.color = {prepared.r, prepared.g, prepared.b, prepared.a};
-            instance.shape = prepared.ellipse ? 1.0F : 0.0F;
+            instance.shape = static_cast<float>(prepared.primitive);
             output[count++] = instance;
         }
         context->Unmap(instances.Get(), 0);

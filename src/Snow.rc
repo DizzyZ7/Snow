@@ -1,7 +1,8 @@
 #include <windows.h>
+101 ICON "Snow.ico"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,3,0,0
+ PRODUCTVERSION 0,3,0,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
  FILEFLAGS 0
  FILEOS VOS_NT_WINDOWS32
@@ -13,11 +14,11 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Snow"
    VALUE "FileDescription", "Snow desktop snowfall (preview)"
-   VALUE "FileVersion", "0.2.0"
+   VALUE "FileVersion", "0.3.0"
    VALUE "InternalName", "Snow"
    VALUE "OriginalFilename", "Snow.exe"
    VALUE "ProductName", "Snow"
-   VALUE "ProductVersion", "0.2.0-preview"
+   VALUE "ProductVersion", "0.3.0-preview"
   END
  END
  BLOCK "VarFileInfo"

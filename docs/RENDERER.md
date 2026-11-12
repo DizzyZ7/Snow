@@ -34,9 +34,19 @@ origin. Each renderer clips the scene to its own monitor. Items are processed in
 input order with source-over alpha. Colors are straight RGBA in the scene and
 premultiplied only during rendering. Invalid/nonfinite geometry or color,
 nonpositive dimensions, zero/negative alpha and invisible items are ignored.
-Valid colors are clamped to `[0,1]`. A shape value of at least `0.5` selects an
-antialiased ellipse; other values select a rectangle. Empty scenes clear the
-previous frame. Shapes use procedural coverage and have no texture assets.
+Valid colors are clamped to `[0,1]`. Shape codes are exact float values:
+
+| `DrawItem::shape` | Primitive |
+| --- | --- |
+| `0.0F` | Rectangle, unchanged |
+| `1.0F` | Antialiased ellipse, unchanged |
+| `2.0F` | Original procedural six-arm snow crystal |
+| Any other value | Ignored, including fractional, negative and nonfinite codes |
+
+Empty scenes clear the previous frame. Shapes use procedural coverage and have
+no texture assets. The crystal is intended for the largest foreground flakes
+at least six physical pixels in diameter; small distant flakes should remain
+ellipses. The scene producer controls this selection and its draw count.
 
 The maximum is `MaxDrawItems` (32,768) per submitted scene. Monitors must have
 positive extents, dimensions at most 16,384 and at most 33,554,432 pixels. Width
@@ -77,6 +87,15 @@ premultiplied source-over blending, then calls `UpdateLayeredWindow` with
 `Ellipse`/`FillRect` alpha behavior is not relied upon. Fractional rectangle
 edges and ellipse edges get procedural antialiasing.
 
+Crystal coverage uses an original six-spine silhouette with two symmetric
+branch tiers, finer outer branches, rounded tips and a small hexagonal hub.
+Absolute coordinates are folded into the nearest 60-degree arm sector using
+fixed dot products. Three segment-distance calculations and a hexagonal hub
+distance are combined, then converted to a one-pixel antialias transition.
+There is no per-pixel trigonometry, halo pass, sprite, texture, cache allocation
+or additional draw item. The branches are intentionally most visible in larger
+flakes; the six-pixel form keeps a fine arm silhouette and low-alpha gaps.
+
 This retains the simple GDI architecture of the MVP while replacing its color
 key and per-frame brush allocation. It still clears and submits a full monitor
 image every frame, so CPU work/bandwidth must be measured. Resizing frees the
@@ -88,19 +107,28 @@ The candidate requires hardware D3D11 feature level 11.0. It compiles embedded
 HLSL once at initialization, creates a composition swap chain with two BGRA8
 buffers (`FLIP_SEQUENTIAL`, `STRETCH`, `PREMULTIPLIED`), attaches one visual and
 target, and renders procedural instanced six-vertex quads. A pixel shader
-computes ellipse coverage and premultiplies color. The blend state uses
+computes ellipse/crystal coverage and premultiplies color. The blend state uses
 `ONE / INV_SRC_ALPHA` for both color and alpha. There is no depth buffer,
 texture atlas, full-frame CPU image or explicit GPU-to-CPU readback.
 
 One persistent dynamic instance buffer holds 32,768 64-byte instances (2 MiB).
 Visible items are written straight into its mapped storage with
 `WRITE_DISCARD`; no per-frame `std::vector` or D3D resource is created. Clipped
-quad positions and original-shape UVs preserve ellipses across monitor edges.
+quad positions and original-shape UVs preserve ellipses and crystals across
+monitor edges. Crystal proportions and distance calculations match the GDI
+path; original UV derivatives establish its antialias width after clipping.
 One 16-byte target constant buffer is updated per frame. DXGI maximum frame
 latency is set to one, and a single `Present(1,0)` is issued per render call.
 Presentation can block for composition/vsync; the application must measure its
 impact across multiple monitors. Drivers can allocate/rename backing storage;
 the declared logical payload is not a bound on driver-managed memory.
+
+Adding the crystal primitive changes no persistent allocation: the existing
+shape float in each 64-byte instance carries `2.0F`; the same quad, blend state,
+instance capacity and swap buffers are reused. It increases arithmetic only
+for crystal fragments. The GDI image size and `cpuBufferBytes()` also remain
+unchanged. Restricting crystals to the largest foreground flakes limits that
+extra work without increasing `MaxDrawItems`.
 
 Both style sets include `WS_EX_LAYERED | WS_EX_TRANSPARENT |
 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`. The candidate also includes
@@ -150,15 +178,22 @@ stability in a short smoke test does not establish eight-hour stability.
 
 ## Verification and remaining evidence
 
-`tests/renderer_smoke.cpp` was written before the interface. Its first syntax
-compile failed on the absent `renderer.hpp`, as expected. After implementation,
-the Linux syntax compile stops at missing `windows.h`: there is no Windows SDK
-or native Windows execution in this environment. Neither renderer is claimed
-to have compiled or run here. Windows CI and interactive results must be
-recorded separately after execution.
+The rectangle/ellipse baseline passed native GDI composited-alpha pixels and
+D3D11 lifecycle tests on the Windows Server 2022 runner in run 43062327292
+(recorded in [ENGINEERING_EVIDENCE.md](ENGINEERING_EVIDENCE.md)); that is not
+evidence for the subsequently added crystal. The crystal's native tests were
+extended before implementation, but this Linux host has no Windows SDK and its
+syntax compile stops at missing `windows.h`. A temporary host harness compiled
+the exact C++ crystal-distance functions with GCC's warning/error flags and
+checked six arm points, six transparent gap points and a partial-alpha edge;
+all those kernel checks passed. Raster previews at 6, 8, 10, 16 and 48 pixels
+were inspected. These checks do not compile HLSL, exercise Win32 presentation or
+establish native resource behavior. The new crystal tests remain pending until
+Windows CI executes them.
 
-The default Windows smoke exercises real HWND/GDI resources: alpha rectangle
-and ellipse submissions, malformed/offscreen items, 120 repeated presentations,
+The default Windows smoke exercises real HWND/GDI resources: alpha rectangle,
+ellipse and crystal submissions, malformed/offscreen items, 120 repeated
+presentations,
 resizes including negative origins, actual HWND position, stable CPU capacity
 and GDI handle counts, oversized inputs/overflowing extents, empty scene clear,
 idempotent release, caller-owned HWND lifetime and release after a failed native
@@ -166,7 +201,14 @@ present. Successful submissions do not themselves validate displayed pixels.
 
 Run `renderer_smoke --visual` only on an unlocked SDR interactive desktop; it
 creates its own blue backdrop, uses `DwmFlush`, reads composited display pixels
-and checks half-transparent red over blue plus clear pixels. HDR/color
+and checks half-transparent red over blue plus clear pixels. It also checks a
+48-pixel crystal's center, all six arms, both branch tiers, all six gaps, partial
+edge alpha, ignored unsupported shape codes, and preserved diagonal-arm/gap coverage after
+cropping the monitor target through the crystal. A six-pixel crystal has
+separate visible-center/arm and low-alpha-gap samples. At this size the one-pixel
+antialias fringe can partly cover a gap; larger-crystal gaps must be fully clear.
+The crystal fixtures use white at alpha `0.5F` over the same blue backdrop; their half-pixel origins
+place centers on pixel centers. HDR/color
 management or unrelated topmost windows can affect the display sample and must
 be recorded with the result. The default smoke prints this pixel check as
 `NOT RUN`.

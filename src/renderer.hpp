@@ -26,6 +26,9 @@ public:
     [[nodiscard]] bool initialize(HWND hwnd, Rect monitor, RendererKind kind);
     [[nodiscard]] bool resize(Rect monitor);
     // Items use absolute physical desktop coordinates and straight RGBA.
+    // Exact shape codes: 0 rectangle, 1 ellipse, 2 six-arm snow crystal.
+    // The crystal is intended for foreground flakes at least 6 physical pixels wide.
+    // Other shape values, including fractional codes, are ignored deterministically.
     // Malformed/invisible items are ignored; an over-capacity span is rejected.
     [[nodiscard]] bool render(std::span<const DrawItem> items);
     void release() noexcept;

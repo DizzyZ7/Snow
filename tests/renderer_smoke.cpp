@@ -92,13 +92,14 @@ bool exerciseRenderer(snow::RendererKind kind, bool optionalCapability, bool& sk
             }
             return expect(false, "initialize GDI renderer");
         }
-        const std::array<snow::DrawItem, 4> items{{
+        const std::array<snow::DrawItem, 5> items{{
             {32, 32, 32, 32, 1, 0, 0, 0.5F, 0},
             {48, 48, 32, 32, 0, 1, 0, 0.5F, 1},
+            {90, 32, 24, 24, 1, 1, 1, 0.75F, 2},
             {-1000, -1000, 1005, 1005, 1, 1, 1, 1, 1},
             {std::numeric_limits<float>::quiet_NaN(), 0, 1, 1, 1, 1, 1, 1, 0}
         }};
-        ok = expect(renderer.render(items), "render overlapping alpha rectangle and ellipse") && ok;
+        ok = expect(renderer.render(items), "render alpha rectangle, ellipse and six-arm crystal") && ok;
         const auto cpuBytes = renderer.cpuBufferBytes();
         ok = expect(cpuBytes > 0 && cpuBytes <= 4ULL * 1024ULL * 1024ULL,
                     "small target CPU buffers remain bounded") && ok;
@@ -127,7 +128,8 @@ bool exerciseRenderer(snow::RendererKind kind, bool optionalCapability, bool& sk
                         positioned.left == monitor.left && positioned.top == monitor.top &&
                         positioned.right == monitor.right && positioned.bottom == monitor.bottom,
                         "resized window preserves absolute negative monitor coordinates") && ok;
-            const snow::DrawItem clipped{-100, -60, 150, 100, 0.5F, 0.25F, 1, 0.75F, 1};
+            const snow::DrawItem clipped{-100, -60, 150, 100, 0.5F, 0.25F, 1, 0.75F,
+                                         iteration % 2 == 0 ? 2.0F : 1.0F};
             if (!expect(renderer.render(std::span(&clipped, 1)), "render clipped resized target")) {
                 ok = false;
                 break;
@@ -208,7 +210,83 @@ bool visualAlpha(snow::RendererKind kind) {
                 "half-alpha red is premultiplied over blue") && ok;
     ok = expect(GetRValue(clear) <= 6 && GetGValue(clear) <= 6 && GetBValue(clear) >= 249,
                 "transparent pixels preserve blue backdrop") && ok;
-    if (ok) std::cout << "PASS: interactive premultiplied-alpha display check\n";
+    // Catches treating shape 2 as an ellipse, a solid star, an opaque mask or a
+    // new clipped quad whose UVs incorrectly restart at the monitor boundary.
+    // A half-pixel origin places the crystal center exactly on a pixel center.
+    const std::array<snow::DrawItem, 7> crystalFixture{{
+        {static_cast<float>(x) + 16.5F, static_cast<float>(y) + 16.5F,
+         48, 48, 1, 1, 1, 0.5F, 2},
+        {static_cast<float>(x) + 72.5F, static_cast<float>(y) + 64.5F,
+         6, 6, 1, 1, 1, 0.5F, 2},
+        {static_cast<float>(x + 72), static_cast<float>(y + 12), 8, 8, 1, 1, 1, 1, -1},
+        {static_cast<float>(x + 72), static_cast<float>(y + 12), 8, 8, 1, 1, 1, 1, 0.5F},
+        {static_cast<float>(x + 72), static_cast<float>(y + 12), 8, 8, 1, 1, 1, 1, 1.5F},
+        {static_cast<float>(x + 72), static_cast<float>(y + 12), 8, 8, 1, 1, 1, 1, 3},
+        {static_cast<float>(x + 72), static_cast<float>(y + 12), 8, 8, 1, 1, 1, 1,
+         std::numeric_limits<float>::quiet_NaN()}
+    }};
+    if (!expect(renderer.render(crystalFixture), "present six-arm crystal fixture")) return false;
+    if (!expect(SUCCEEDED(DwmFlush()), "wait for composited crystal fixture")) return false;
+    screen = GetDC(nullptr);
+    if (!screen) return expect(false, "capture composited crystal pixels");
+    const auto whiteOverBlue = [](COLORREF pixel) {
+        return pixel != CLR_INVALID && std::abs(static_cast<int>(GetRValue(pixel)) - 128) <= 6 &&
+               std::abs(static_cast<int>(GetGValue(pixel)) - 128) <= 6 && GetBValue(pixel) >= 249;
+    };
+    const auto transparentBlue = [](COLORREF pixel) {
+        return pixel != CLR_INVALID && GetRValue(pixel) <= 6 &&
+               GetGValue(pixel) <= 6 && GetBValue(pixel) >= 249;
+    };
+    ok = expect(whiteOverBlue(GetPixel(screen, x + 40, y + 40)),
+                "crystal center retains half-alpha white coverage") && ok;
+    constexpr std::array<POINT, 6> armOffsets{{{0, -16}, {14, -8}, {14, 8},
+                                              {0, 16}, {-14, 8}, {-14, -8}}};
+    for (const POINT offset : armOffsets) {
+        ok = expect(whiteOverBlue(GetPixel(screen, x + 40 + offset.x, y + 40 + offset.y)),
+                    "each of six crystal arms has opaque geometric coverage") && ok;
+    }
+    constexpr std::array<POINT, 4> branchOffsets{{{4, -14}, {-4, -14}, {3, -19}, {-3, -19}}};
+    for (const POINT offset : branchOffsets) {
+        ok = expect(whiteOverBlue(GetPixel(screen, x + 40 + offset.x, y + 40 + offset.y)),
+                    "both fine branch tiers extend beyond a plain six-spoke star") && ok;
+    }
+    constexpr std::array<POINT, 6> gapOffsets{{{9, -16}, {18, 0}, {9, 16},
+                                              {-9, 16}, {-18, 0}, {-9, -16}}};
+    for (const POINT offset : gapOffsets) {
+        ok = expect(transparentBlue(GetPixel(screen, x + 40 + offset.x, y + 40 + offset.y)),
+                    "gaps between crystal arms remain transparent") && ok;
+    }
+    const COLORREF antialiased = GetPixel(screen, x + 42, y + 24);
+    ok = expect(antialiased != CLR_INVALID && GetRValue(antialiased) >= 4 &&
+                GetRValue(antialiased) <= 100 &&
+                std::abs(static_cast<int>(GetRValue(antialiased)) - GetGValue(antialiased)) <= 2 &&
+                GetBValue(antialiased) >= 249,
+                "crystal edge has partial premultiplied alpha coverage") && ok;
+    ok = expect(transparentBlue(GetPixel(screen, x + 76, y + 16)),
+                "unsupported and nonfinite primitive codes are ignored") && ok;
+    const COLORREF smallCenter = GetPixel(screen, x + 75, y + 67);
+    const COLORREF smallArm = GetPixel(screen, x + 75, y + 65);
+    ok = expect(smallCenter != CLR_INVALID && GetRValue(smallCenter) >= 64 &&
+                GetRValue(smallCenter) <= 134 && GetBValue(smallCenter) >= 249 &&
+                smallArm != CLR_INVALID && GetRValue(smallArm) >= 40 &&
+                GetRValue(smallArm) <= 134 && GetBValue(smallArm) >= 249,
+                "six-pixel crystal retains a visible center and fine arm") && ok;
+    const COLORREF smallGap = GetPixel(screen, x + 77, y + 65);
+    ok = expect(smallGap != CLR_INVALID && GetRValue(smallGap) <= 32 &&
+                GetGValue(smallGap) <= 32 && GetBValue(smallGap) >= 249,
+                "six-pixel crystal gaps remain mostly transparent through antialiasing") && ok;
+    ReleaseDC(nullptr, screen);
+    if (!expect(renderer.resize({x + 40, y, x + 96, y + 96}), "clip crystal at monitor edge") ||
+        !expect(renderer.render(crystalFixture), "render clipped crystal without restarting its UVs") ||
+        !expect(SUCCEEDED(DwmFlush()), "wait for clipped crystal fixture")) return false;
+    screen = GetDC(nullptr);
+    if (!screen) return expect(false, "capture clipped crystal pixels");
+    ok = expect(whiteOverBlue(GetPixel(screen, x + 54, y + 32)),
+                "clipped crystal preserves its original diagonal arm") && ok;
+    ok = expect(transparentBlue(GetPixel(screen, x + 58, y + 40)),
+                "clipped crystal preserves its original transparent gap") && ok;
+    ReleaseDC(nullptr, screen);
+    if (ok) std::cout << "PASS: interactive alpha/crystal pixel check\n";
     return ok;
 }
 }
