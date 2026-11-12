@@ -25,6 +25,7 @@ class HeightField {
 public:
     explicit HeightField(int width = 0) { resize(width); }
     void resize(int width);
+    void clampDepth(float maximum) noexcept;
     float deposit(float x, float volume, float maxDepth) noexcept;
     float clear(float x, float radius, float strength) noexcept;
     float collect(float x, float radius, float amount) noexcept;
@@ -61,6 +62,9 @@ struct Decoration {
     std::uint64_t surfaceId{};
     float localX{}, radius{}, age{};
     Tool kind{Tool::Snowball};
+    std::uint64_t id{}, parentId{};
+    float volume{}, rise{}; // conserved snow volume; bottom above the owner's edge
+    bool decorated{}; // a face on the head of three actual stacked balls
 };
 class SnowSimulation {
 public:
@@ -70,6 +74,10 @@ public:
     void setPaused(bool paused) noexcept;
     void advance(double elapsedSeconds);
     bool useTool(Tool tool, float x, float y);
+    bool beginInteraction(Tool tool, float x, float y);
+    bool dragInteraction(float x, float y);
+    void endInteraction() noexcept;
+    void clearSnow() noexcept;
     void buildScene(std::vector<DrawItem>& scene, bool interactive = false) const;
     [[nodiscard]] std::span<const Particle> particles() const noexcept { return {particles_.data(), count_}; }
     [[nodiscard]] std::span<const Decoration> decorations() const noexcept { return decorations_; }
@@ -79,12 +87,25 @@ private:
     float random() noexcept;
     void spawn(Particle& particle, bool initial) noexcept;
     void step(float dt);
+    void pruneDecorations() noexcept;
+    [[nodiscard]] Decoration* findDecoration(std::uint64_t id) noexcept;
+    [[nodiscard]] const Decoration* findDecoration(std::uint64_t id) const noexcept;
+    [[nodiscard]] const Decoration* childOf(std::uint64_t id) const noexcept;
+    [[nodiscard]] float chainHeight(std::uint64_t id) const noexcept;
+    [[nodiscard]] float decorationRise(const Decoration& decoration, std::size_t depth = 0) const noexcept;
+    [[nodiscard]] bool decorationVisible(const Decoration& decoration, std::size_t depth = 0) const noexcept;
     Rect bounds_{};
     Settings settings_{};
     std::array<Particle, MaxParticles> particles_{};
     std::size_t count_{}, targetCount_{800};
     SnowAccumulation accumulation_;
     std::vector<Decoration> decorations_;
+    struct Interaction {
+        Tool tool{Tool::None};
+        std::uint64_t ballId{};
+        float offsetX{}, bottomOffset{};
+    } interaction_;
+    std::uint64_t nextDecorationId_{1};
     std::uint32_t rng_;
     double remainder_{};
     std::uint64_t steps_{};

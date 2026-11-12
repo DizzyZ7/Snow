@@ -8,6 +8,32 @@
 namespace snow {
 namespace {
 constexpr double FixedStep = 1.0 / 120.0;
+constexpr float SnowBand = 96;
+constexpr float BallMassScale = 400.f / (11.f * 11.f);
+constexpr float MaximumBallRadius = 18;
+constexpr float MaximumDragDistance = 256;
+constexpr std::size_t MaximumDecorations = 32;
+constexpr std::size_t MaximumStack = 3;
+bool footprintVisible(const SurfaceSpec& spec, float left, float right) noexcept {
+    return left >= static_cast<float>(spec.bounds.left) && right <= static_cast<float>(spec.bounds.right) &&
+        std::any_of(spec.visible.begin(), spec.visible.end(), [left, right](Span span) {
+            return left >= static_cast<float>(span.left) && right <= static_cast<float>(span.right);
+        });
+}
+float figureHeight(const Decoration& decoration) noexcept {
+    return decoration.radius * (decoration.kind == Tool::Snowman ? 4.17f : 2.f);
+}
+float collectionRadius(const SurfaceSpec& spec, float x, float requested) noexcept {
+    for (Span span : spec.visible) {
+        if (x >= static_cast<float>(span.left) && x < static_cast<float>(span.right)) {
+            // Whole 8px bins only: do not collect a bin that straddles occlusion.
+            const float margin = static_cast<float>(CellWidth) * .5f;
+            return std::max(0.f, std::min({requested, x - static_cast<float>(span.left) - margin,
+                static_cast<float>(span.right) - x - margin}));
+        }
+    }
+    return 0;
+}
 bool visible(const SurfaceSpec& spec, float x) noexcept {
     return std::any_of(spec.visible.begin(), spec.visible.end(), [x](Span span) {
         return x >= static_cast<float>(span.left) && x < static_cast<float>(span.right);
@@ -82,6 +108,10 @@ void HeightField::resize(int width) {
     heights_.resize(cells, 0);
     // Topology events only; release oversized retained storage after a substantial shrink.
     if (heights_.capacity() > std::max<std::size_t>(64, cells * 2)) heights_.shrink_to_fit();
+}
+void HeightField::clampDepth(float maximum) noexcept {
+    maximum = std::isfinite(maximum) ? std::clamp(maximum, 0.f, 96.f) : 0.f;
+    for (float& height : heights_) height = std::min(height, maximum);
 }
 float HeightField::height(float x) const noexcept {
     if (!std::isfinite(x) || x < 0 || x >= static_cast<float>(width_) || heights_.empty()) return 0;
@@ -160,10 +190,15 @@ void SnowAccumulation::reconcile(std::span<const SurfaceSpec> snapshot) {
         SurfaceState* state = nullptr;
         if (it == surfaces_.end()) {
             if (surfaces_.size() == MaxSurfaces) break;
-            surfaces_.push_back({spec, HeightField(spec.bounds.width())});
+            // Never copy an untrusted source vector before applying its limit.
+            surfaces_.push_back({{spec.id, spec.bounds, spec.taskbar, {}}, HeightField(spec.bounds.width())});
             state = &surfaces_.back();
-        } else { it->field.resize(spec.bounds.width()); it->spec = spec; state = &*it; }
-        if (state->spec.visible.size() > 32) state->spec.visible.resize(32);
+        } else {
+            it->field.resize(spec.bounds.width()); it->spec.id = spec.id;
+            it->spec.bounds = spec.bounds; it->spec.taskbar = spec.taskbar; state = &*it;
+        }
+        const auto count = std::min<std::size_t>(spec.visible.size(), 32);
+        state->spec.visible.assign(spec.visible.begin(), spec.visible.begin() + static_cast<std::ptrdiff_t>(count));
     }
     std::iota(sorted_.begin(), sorted_.begin() + static_cast<std::ptrdiff_t>(surfaces_.size()), std::size_t{});
     std::sort(sorted_.begin(), sorted_.begin() + static_cast<std::ptrdiff_t>(surfaces_.size()), [&](std::size_t a, std::size_t b) { return surfaces_[a].spec.bounds.top < surfaces_[b].spec.bounds.top; });
@@ -208,7 +243,7 @@ const SurfaceState* SnowAccumulation::find(std::uint64_t id) const noexcept {
 float SnowAccumulation::totalVolume() const noexcept {
     float sum = 0; for (const auto& s : surfaces_) sum += s.field.volume(); return sum;
 }
-SnowSimulation::SnowSimulation(std::uint32_t seed) : rng_(seed ? seed : 1) { decorations_.reserve(32); }
+SnowSimulation::SnowSimulation(std::uint32_t seed) : rng_(seed ? seed : 1) { decorations_.reserve(MaximumDecorations); }
 float SnowSimulation::random() noexcept {
     rng_ ^= rng_ << 13; rng_ ^= rng_ >> 17; rng_ ^= rng_ << 5;
     return static_cast<float>(rng_ >> 8) * (1.f / 16777216.f);
@@ -218,6 +253,9 @@ void SnowSimulation::spawn(Particle& p, bool initial) noexcept {
     p.y = initial ? static_cast<float>(bounds_.top) + random() * static_cast<float>(bounds_.height()) : static_cast<float>(bounds_.top) - 8;
     p.speed = 24 + random() * 65; p.drift = (random() - .5f) * 30;
     p.radius = .8f + random() * 1.9f; p.phase = random() * 6.2831853f;
+    // A small deterministic foreground population reads as crystals at normal
+    // size; the rest keep the compact ellipse treatment and the same item count.
+    if (p.phase < .31415927f) p.radius = 3 + p.phase * (.4f / .31415927f);
 }
 void SnowSimulation::setBounds(Rect bounds) {
     if (!safeRect(bounds)) bounds = {};
@@ -231,12 +269,16 @@ void SnowSimulation::setBounds(Rect bounds) {
 }
 void SnowSimulation::setSettings(Settings s) noexcept {
     settings_ = validated(s);
+    for (auto& state : accumulation_.surfaces()) state.field.clampDepth(settings_.maxDepth);
     constexpr std::size_t counts[]{300, 800, 1600, 2600};
     targetCount_ = settings_.weather == Weather::Custom ? static_cast<std::size_t>(settings_.particles) : counts[static_cast<std::size_t>(settings_.weather)];
     if (settings_.profile == Profile::Eco) targetCount_ = std::min<std::size_t>(targetCount_, 700);
+    pruneDecorations();
 }
 void SnowSimulation::setPaused(bool value) noexcept { paused_ = value; remainder_ = 0; }
 void SnowSimulation::advance(double elapsed) {
+    // Lifecycle cleanup also runs on a paused/zero-time model update.
+    pruneDecorations();
     if (paused_ || !bounds_.valid() || !std::isfinite(elapsed) || elapsed <= 0) return;
     remainder_ += std::min(elapsed, FixedStep * 8);
     unsigned loops = 0;
@@ -269,30 +311,260 @@ void SnowSimulation::step(float dt) {
         const bool landed = settings_.accumulation && accumulation_.deposit(p.x, oldY, p.y, p.radius * p.radius * 7 * settings_.accumulationRate, settings_.maxDepth);
         if (landed || p.y > static_cast<float>(bounds_.bottom) + 8) spawn(p, false);
     }
-    std::erase_if(decorations_, [&](Decoration& d) {
-        d.age = std::min(d.age + dt, 1.f);
-        const auto* state = accumulation_.find(d.surfaceId);
-        return !state || d.localX < 0 || d.localX >= static_cast<float>(state->field.width());
-    });
+    for (auto& decoration : decorations_) decoration.age = std::min(decoration.age + dt, 1.f);
+    pruneDecorations();
+}
+Decoration* SnowSimulation::findDecoration(std::uint64_t id) noexcept {
+    for (auto& decoration : decorations_) if (decoration.id == id) return &decoration;
+    return nullptr;
+}
+const Decoration* SnowSimulation::findDecoration(std::uint64_t id) const noexcept {
+    for (const auto& decoration : decorations_) if (decoration.id == id) return &decoration;
+    return nullptr;
+}
+const Decoration* SnowSimulation::childOf(std::uint64_t id) const noexcept {
+    for (const auto& decoration : decorations_) if (decoration.parentId == id) return &decoration;
+    return nullptr;
+}
+float SnowSimulation::chainHeight(std::uint64_t id) const noexcept {
+    float height = 0;
+    for (std::size_t count = 0; count < MaximumDecorations; ++count) {
+        const auto* decoration = findDecoration(id);
+        if (!decoration) return height;
+        height += figureHeight(*decoration);
+        const auto* child = childOf(id);
+        if (!child) return height;
+        id = child->id;
+    }
+    return SnowBand + 1; // A cycle never becomes a drawable or valid placement.
+}
+float SnowSimulation::decorationRise(const Decoration& decoration, std::size_t depth) const noexcept {
+    if (depth >= MaximumDecorations) return SnowBand + 1;
+    const auto* state = accumulation_.find(decoration.surfaceId);
+    if (!state) return SnowBand + 1;
+    if (interaction_.ballId == decoration.id) return decoration.rise;
+    if (decoration.parentId != 0) {
+        const auto* parent = findDecoration(decoration.parentId);
+        return parent ? decorationRise(*parent, depth + 1) + figureHeight(*parent) : SnowBand + 1;
+    }
+    // A growing drift may bury the base, but never pushes a whole stack through
+    // the tracking band's ceiling. All contacts use this same derived position.
+    return std::min(state->field.height(decoration.localX), std::max(0.f, SnowBand - chainHeight(decoration.id) - .01f));
+}
+bool SnowSimulation::decorationVisible(const Decoration& decoration, std::size_t depth) const noexcept {
+    if (depth >= MaximumDecorations) return false;
+    const auto* state = accumulation_.find(decoration.surfaceId);
+    if (!state) return false;
+    const float x = static_cast<float>(state->spec.bounds.left) + decoration.localX;
+    const float rise = decorationRise(decoration);
+    if (!footprintVisible(state->spec, x - decoration.radius, x + decoration.radius) ||
+        rise < 0 || rise + figureHeight(decoration) > SnowBand + .001f) return false;
+    const auto* parent = findDecoration(decoration.parentId);
+    return decoration.parentId == 0 || (parent && decorationVisible(*parent, depth + 1));
+}
+void SnowSimulation::pruneDecorations() noexcept {
+    for (std::size_t pass = 0; pass < MaximumDecorations; ++pass) {
+        const auto size = decorations_.size();
+        std::erase_if(decorations_, [&](const Decoration& decoration) {
+            const auto* state = accumulation_.find(decoration.surfaceId);
+            if (!state || !decoration.id || !std::isfinite(decoration.radius) || decoration.radius <= 0 ||
+                !std::isfinite(decoration.volume) || decoration.volume <= 0 || !std::isfinite(decoration.localX) ||
+                decoration.localX - decoration.radius < 0 ||
+                decoration.localX + decoration.radius > static_cast<float>(state->field.width())) return true;
+            const Decoration* node = &decoration;
+            for (std::size_t depth = 0; node->parentId != 0; ++depth) {
+                const auto* parent = findDecoration(node->parentId);
+                if (depth >= MaximumStack - 1 || !parent || parent->id == decoration.id ||
+                    parent->surfaceId != decoration.surfaceId || parent->kind != Tool::Snowball ||
+                    node->kind != Tool::Snowball) return true;
+                node = parent;
+            }
+            return chainHeight(node->id) > SnowBand + .001f;
+        });
+        if (size == decorations_.size()) break;
+    }
+    if (interaction_.ballId && !findDecoration(interaction_.ballId)) interaction_ = {};
+    for (auto& decoration : decorations_) {
+        decoration.rise = decorationRise(decoration);
+        decoration.decorated = false;
+        if (decoration.kind != Tool::Snowball || decoration.parentId == 0) continue;
+        const auto* parent = findDecoration(decoration.parentId);
+        if (parent && parent->parentId != 0) decoration.decorated = true;
+    }
 }
 bool SnowSimulation::useTool(Tool tool, float x, float y) {
+    pruneDecorations();
     if (!std::isfinite(x) || !std::isfinite(y)) return false;
     const float strength = settings_.interaction;
     if (tool == Tool::Mitten || tool == Tool::Shovel)
         return accumulation_.clear(x, y, (tool == Tool::Shovel ? 90 : 35) * strength, 14 * strength) > 0;
-    if ((tool != Tool::Snowball && tool != Tool::Snowman) || decorations_.size() >= 32) return false;
+    if ((tool != Tool::Snowball && tool != Tool::Snowman) || decorations_.size() >= MaximumDecorations) return false;
     auto* state = accumulation_.hit(x, y, 80);
     if (!state) return false;
     const float local = x - static_cast<float>(state->spec.bounds.left);
+    const float top = static_cast<float>(state->spec.bounds.top);
+    const float radius = tool == Tool::Snowball ? 11.f : 16.f;
+    if (y < top - SnowBand || y > top || !footprintVisible(state->spec, x - radius, x + radius)) return false;
     const float needed = tool == Tool::Snowball ? 400.f : 1800.f;
-    if (state->field.available(local, 80) + .001f < needed) return false;
-    state->field.collect(local, 80, needed);
-    decorations_.push_back({state->spec.id, local, tool == Tool::Snowball ? 11.f : 16.f, 0, tool});
+    const float reach = collectionRadius(state->spec, x, 80);
+    if (state->field.available(local, reach) < needed) return false;
+    const float taken = state->field.collect(local, reach, needed);
+    if (taken <= 0) return false;
+    const float actualRadius = tool == Tool::Snowball ? std::sqrt(taken / BallMassScale) : radius;
+    decorations_.push_back({state->spec.id, local, actualRadius, 0, tool, nextDecorationId_++, 0, taken, 0, false});
+    if (nextDecorationId_ == 0) ++nextDecorationId_;
+    pruneDecorations();
     return true;
+}
+bool SnowSimulation::beginInteraction(Tool tool, float x, float y) {
+    pruneDecorations();
+    if (!std::isfinite(x) || !std::isfinite(y) || tool == Tool::None ||
+        static_cast<unsigned>(tool) > static_cast<unsigned>(Tool::Snowman)) return false;
+    const bool supported = std::any_of(accumulation_.surfaces().begin(), accumulation_.surfaces().end(),
+        [x, y](const SurfaceState& state) {
+            const float top = static_cast<float>(state.spec.bounds.top);
+            const float local = x - static_cast<float>(state.spec.bounds.left);
+            return local >= 0 && local < static_cast<float>(state.field.width()) && visible(state.spec, x) &&
+                y >= top - SnowBand && y <= top;
+        });
+    if (!supported) return false;
+    endInteraction();
+    if (tool == Tool::Mitten || tool == Tool::Shovel) {
+        if (!accumulation_.hit(x, y, 80)) return false;
+        interaction_.tool = tool;
+        useTool(tool, x, y);
+        return true;
+    }
+    if (tool != Tool::Snowball) return useTool(tool, x, y);
+    Decoration* selected = nullptr;
+    float closest = std::numeric_limits<float>::max();
+    bool blocked{};
+    for (auto& decoration : decorations_) {
+        if (decoration.kind != Tool::Snowball || !decorationVisible(decoration)) continue;
+        const auto* state = accumulation_.find(decoration.surfaceId);
+        if (!state) continue;
+        const float centerX = static_cast<float>(state->spec.bounds.left) + decoration.localX;
+        const float centerY = static_cast<float>(state->spec.bounds.top) - decoration.rise - decoration.radius;
+        const float dx = x - centerX, dy = y - centerY;
+        const float distance = dx * dx + dy * dy;
+        const float reach = decoration.radius + 4;
+        if (distance > reach * reach || distance > closest) continue;
+        closest = distance;
+        blocked = childOf(decoration.id) != nullptr;
+        selected = &decoration;
+    }
+    if (selected && blocked) return false;
+    if (!selected) {
+        if (!useTool(tool, x, y)) return false;
+        selected = &decorations_.back();
+    }
+    const auto* state = accumulation_.find(selected->surfaceId);
+    if (!state) return false;
+    const float top = static_cast<float>(state->spec.bounds.top);
+    if (y < top - SnowBand || y > top) return false;
+    const float bottom = top - selected->rise;
+    selected->parentId = 0;
+    interaction_ = {tool, selected->id, static_cast<float>(state->spec.bounds.left) + selected->localX - x, bottom - y};
+    pruneDecorations();
+    return true;
+}
+bool SnowSimulation::dragInteraction(float x, float y) {
+    pruneDecorations();
+    if (!std::isfinite(x) || !std::isfinite(y)) return false;
+    if (interaction_.tool == Tool::Mitten || interaction_.tool == Tool::Shovel)
+        return useTool(interaction_.tool, x, y);
+    auto* decoration = findDecoration(interaction_.ballId);
+    if (interaction_.tool != Tool::Snowball || !decoration || !decorationVisible(*decoration)) return false;
+    SurfaceState* state = nullptr;
+    for (auto& surface : accumulation_.surfaces()) if (surface.spec.id == decoration->surfaceId) { state = &surface; break; }
+    if (!state) return false;
+    const float top = static_cast<float>(state->spec.bounds.top);
+    if (y < top - SnowBand || y > top) return false;
+    const float worldX = x + interaction_.offsetX;
+    const float local = worldX - static_cast<float>(state->spec.bounds.left);
+    const float distance = std::abs(local - decoration->localX);
+    if (distance > MaximumDragDistance) return false;
+    const float oldWorld = static_cast<float>(state->spec.bounds.left) + decoration->localX;
+    const float low = std::min(oldWorld, worldX), high = std::max(oldWorld, worldX);
+    const Span* path = nullptr;
+    for (const auto& span : state->spec.visible) {
+        if (low - decoration->radius >= static_cast<float>(span.left) &&
+            high + decoration->radius <= static_cast<float>(span.right)) { path = &span; break; }
+    }
+    if (!path || !footprintVisible(state->spec, low - decoration->radius, high + decoration->radius)) return false;
+    const float requestedRise = std::max(0.f, top - (y + interaction_.bottomOffset));
+    const float radiusLimit = std::min({MaximumBallRadius, low - static_cast<float>(path->left),
+        static_cast<float>(path->right) - high, (SnowBand - requestedRise) * .5f});
+    if (radiusLimit + .001f < decoration->radius) return false;
+    const float ground = std::min(state->field.height(local), SnowBand - decoration->radius * 2);
+    const bool rolling = requestedRise <= ground + 2;
+    if (rolling && distance > 0) {
+        const float room = std::max(0.f, radiusLimit * radiusLimit * BallMassScale - decoration->volume);
+        float remaining = std::min(room, distance * 2);
+        const auto samples = static_cast<unsigned>(std::clamp(std::ceil(distance / static_cast<float>(CellWidth)), 1.f, 32.f));
+        const float portion = remaining / static_cast<float>(samples);
+        for (unsigned sample = 1; sample <= samples && remaining > 0; ++sample) {
+            const float at = decoration->localX + (local - decoration->localX) *
+                static_cast<float>(sample) / static_cast<float>(samples);
+            const float physical = static_cast<float>(state->spec.bounds.left) + at;
+            const float reach = collectionRadius(state->spec, physical, decoration->radius);
+            const float taken = state->field.collect(at, reach, std::min(remaining, portion));
+            decoration->volume += taken; remaining -= taken;
+        }
+        decoration->radius = std::sqrt(decoration->volume / BallMassScale);
+    }
+    decoration->localX = local;
+    decoration->rise = std::max(requestedRise, std::min(state->field.height(local), SnowBand - decoration->radius * 2));
+    return true;
+}
+void SnowSimulation::endInteraction() noexcept {
+    pruneDecorations();
+    auto* moving = findDecoration(interaction_.ballId);
+    if (moving) {
+        Decoration* support = nullptr;
+        float closest = std::numeric_limits<float>::max();
+        for (auto& candidate : decorations_) {
+            if (candidate.id == moving->id || candidate.surfaceId != moving->surfaceId ||
+                candidate.kind != Tool::Snowball || childOf(candidate.id) ||
+                moving->radius > candidate.radius + .001f || !decorationVisible(candidate)) continue;
+            bool cycle{};
+            std::size_t depth = 1;
+            const Decoration* ancestor = &candidate;
+            for (; ancestor; ancestor = findDecoration(ancestor->parentId)) {
+                if (ancestor->id == moving->id || depth++ >= MaximumStack) { cycle = true; break; }
+                if (ancestor->parentId == 0) break;
+            }
+            if (cycle) continue;
+            const float target = decorationRise(candidate) + candidate.radius * 2;
+            const float dx = std::abs(moving->localX - candidate.localX), dy = std::abs(moving->rise - target);
+            if (dx > std::max(6.f, moving->radius * .6f) || dy > 12 || target + moving->radius * 2 > SnowBand) continue;
+            const auto* state = accumulation_.find(moving->surfaceId);
+            if (!state) continue;
+            const float left = static_cast<float>(state->spec.bounds.left);
+            if (!footprintVisible(state->spec, left + std::min(moving->localX, candidate.localX) - moving->radius,
+                    left + std::max(moving->localX, candidate.localX) + moving->radius)) continue;
+            const float score = dx * dx + dy * dy;
+            if (score < closest) { closest = score; support = &candidate; }
+        }
+        if (support) { moving->parentId = support->id; moving->localX = support->localX; }
+    }
+    interaction_ = {};
+    pruneDecorations();
+}
+void SnowSimulation::clearSnow() noexcept {
+    interaction_ = {};
+    decorations_.clear();
+    for (auto& state : accumulation_.surfaces()) state.field.clampDepth(0);
 }
 void SnowSimulation::buildScene(std::vector<DrawItem>& scene, bool interactive) const {
     scene.clear(); if (!bounds_.valid()) return;
-    const std::size_t budget = MaxDrawItems - (interactive ? 1 : 0);
+    const std::size_t completeBudget = MaxDrawItems - (interactive ? 1 : 0);
+    std::size_t figureBudget = 0;
+    for (const auto& decoration : decorations_) if (decorationVisible(decoration))
+        figureBudget += decoration.kind == Tool::Snowman ? 7 : decoration.decorated ? 4 : 1;
+    // Ledges may be dense on a large desktop. Reserve the known finite output
+    // for weather and visible figures before using the remaining height budget.
+    std::size_t budget = completeBudget - count_ - figureBudget;
     const auto add = [&](DrawItem item) { if (scene.size() < budget) scene.push_back(item); };
     if (settings_.accumulation) for (const auto& s : accumulation_.surfaces()) {
         const auto cells = s.field.cells();
@@ -312,23 +584,20 @@ void SnowSimulation::buildScene(std::vector<DrawItem>& scene, bool interactive) 
             }
         }
     }
+    budget = completeBudget;
     for (std::size_t i = 0; i < count_; ++i) {
         const auto& p = particles_[i]; const float r = p.radius * size_;
-        add({p.x - r, p.y - r, r * 2, r * 2, .96f, .98f, 1, .45f + p.radius * .18f, 1});
+        const float shape = r * 2 >= 6 && p.phase < 1.5707963f ? 2.f : 1.f;
+        add({p.x - r, p.y - r, r * 2, r * 2, .96f, .98f, 1, std::min(1.f, .45f + p.radius * .18f), shape});
     }
     for (const auto& d : decorations_) {
         const auto* s = accumulation_.find(d.surfaceId); if (!s) continue;
+        if (!decorationVisible(d)) continue;
         const float x = static_cast<float>(s->spec.bounds.left) + d.localX;
-        const bool fits = std::any_of(s->spec.visible.begin(), s->spec.visible.end(), [&](Span span) {
-            return x - d.radius >= static_cast<float>(span.left) && x + d.radius <= static_cast<float>(span.right);
-        });
-        if (!fits) continue;
-        // Keep figures inside the same 96px band used by occlusion tracking.
-        // Deep drifts partly bury their base rather than letting them cross a higher window.
-        const float figureHeight = d.radius * (d.kind == Tool::Snowman ? 4.17f : 2.f);
-        const float rise = std::min(s->field.height(d.localX), std::max(0.f, 96 - figureHeight - 8));
+        const float rise = decorationRise(d);
         const float y = static_cast<float>(s->spec.bounds.top) - rise;
-        const float bounce = d.age < .5f ? std::sin(d.age * 6.2831853f) * 8 * (1 - d.age * 2) : 0;
+        const float bounce = d.kind == Tool::Snowman && d.age < .5f ?
+            std::min(std::max(0.f, SnowBand - rise - figureHeight(d)), std::sin(d.age * 6.2831853f) * 8 * (1 - d.age * 2)) : 0;
         const float radius = d.radius;
         auto circle = [&](float cx, float cy, float r, float red, float green, float blue) { add({cx - r, cy - r - bounce, r * 2, r * 2, red, green, blue, 1, 1}); };
         circle(x, y - radius, radius, .92f, .96f, 1);
@@ -339,6 +608,11 @@ void SnowSimulation::buildScene(std::vector<DrawItem>& scene, bool interactive) 
             circle(x + 3, y - radius * 3.8f, 1.2f, .1f, .15f, .2f);
             add({x, y - radius * 3.55f - bounce, 8, 3, 1, .4f, .12f, 1, 0});
             add({x - 10, y - radius * 3.05f - bounce, 20, 4, .65f, .1f, .16f, 1, 0});
+        } else if (d.decorated) {
+            const float center = y - radius;
+            circle(x - radius * .3f, center - radius * .2f, 1.2f, .1f, .15f, .2f);
+            circle(x + radius * .3f, center - radius * .2f, 1.2f, .1f, .15f, .2f);
+            add({x, center, std::min(8.f, radius), 3, 1, .4f, .12f, 1, 0});
         }
     }
     if (interactive) scene.push_back({static_cast<float>(bounds_.left), static_cast<float>(bounds_.top),

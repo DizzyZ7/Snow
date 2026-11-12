@@ -27,7 +27,7 @@ struct SurfaceSpec {
 };
 // x/y are the top-left of a quad in physical desktop coordinates.
 // Color is straight RGBA; the renderer emits premultiplied alpha.
-// shape: 0 rectangle, 1 antialiased ellipse. No textures or external assets.
+// shape: 0 rectangle, 1 antialiased ellipse, 2 six-arm snow crystal. No textures or external assets.
 struct DrawItem {
     float x{}, y{}, w{}, h{};
     float r{1}, g{1}, b{1}, a{1};
