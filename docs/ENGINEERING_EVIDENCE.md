@@ -34,3 +34,31 @@ Five real 3-second samples on Windows Server 2022 / Hyper-V Video / 4 logical CP
 - Active GDI benchmark: seven samples over 20.037s, all running, no suspension flags, actual renderer GDI. Private Bytes/Commit 6,586,368 bytes; Working Set 20,930,560; private Working Set 4,907,008; GDI/USER counts 2/15 throughout. GPU counters unavailable. CPU time counter did not increase over this short sample; no reliable steady-state CPU percentage is inferred from that.
 - Measured native submissions: 21–21.5/sec versus target 30.303. This exposed message-timer pacing granularity. The frame clock now uses a high-resolution waitable timer when supported, regular waitable fallback on early Windows 10, and MsgWaitForMultipleObjectsEx. No spin loop or timeBeginPeriod call. New runtime/pacing measurements are required before declaring the change verified.
 - Raw active samples: docs/profiles/2026-11-11-gdi-settimer.csv and its metadata. These Windows Server/Hyper-V measurements do not establish Windows 10/11 hardware GPU, multi-DPI or 8-hour stability.
+
+## Snow 0.3 verified native run (173094e, 2026-11-12)
+
+Run 43227509224 completed successfully: Release/Debug x64, MSVC AddressSanitizer and /analyze with warnings as errors. Each runtime configuration passed all TEN CTests. No GPU test was skipped. Linux sanitizer/leak run 43227509151 passed. The final native suite covers original crystal pixels in both GDI/D3D, real SendInput routing to a different process and back, no-focus behavior, real CPU counter work, window generation/occlusion, and application lifecycle including popup animation and capture cancellation.
+
+The previous redirected-GUI harness returned a null Process.ExitCode after all four stages completed. Holding its native handle before waiting and draining output allowed the actual exit code to be read; the full suite then passed. No null exit code was converted to success.
+
+Portable ZIP, SHA-256 and the 0.3 installer built. Silent installation, installed executable lifecycle and silent uninstall passed. Artifact: 13948114846.
+
+### Same-runner active comparison (20s each, seven actual samples)
+
+Windows Server2022, Hyper-V Video, four logical CPUs, default weather/settings, sequential fresh processes. Both reported running, actual requested renderer, no pause flags; native GetProcessTimes counters were available. This is a single virtual-machine comparison, not a physical Windows10/11 hardware verdict.
+
+| Counter | GDI | D3D11/DirectComposition |
+| --- | ---: | ---: |
+| Private Bytes / private commit, peak bytes | 6,737,920 | 10,342,400 |
+| Working Set, peak bytes | 21,655,552 | 29,401,088 |
+| Private Working Set, peak bytes | 5,025,792 | 4,300,800 |
+| CPU machine share, arithmetic mean | 0.0372% | 0.2512% |
+| Native submissions/sec, arithmetic mean | 30.026 | 30.041 |
+| GDI objects (stable) | 9 | 7 |
+| USER objects (stable) | 15 | 15 |
+
+GDI GPU counters had no process instance; D3D counters reported zero on the virtual adapter. These do not validate physical dedicated/shared GPU usage. No RAM/GPU totals are combined. Raw CSV and environment/hash metadata are in docs/profiles/2026-11-12-*-20s*.
+
+Decision: keep GDI default on this evidence; the GPU candidate is functional and opt-in. Its lower private working set alone does not outweigh its higher private commit, total working set and CPU cost in this VM. Physical GPU comparisons and multi-monitor budgets remain open.
+
+The default GDI profile is extended to five minutes in CI. Its raw data and outcome are published in the Windows build artifact and linked from PR #1 after completion. No 30-minute, 2-hour or 8-hour success is inferred.

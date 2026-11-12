@@ -1,0 +1,44 @@
+{
+  "SchemaVersion": 3,
+  "Status": "complete",
+  "Error": null,
+  "StartedUtc": "2026-11-12T13:29:05.4816199Z",
+  "FinishedUtc": "2026-11-12T13:29:25.7304304Z",
+  "RequestedDurationSeconds": 20,
+  "RequestedIntervalSeconds": 3,
+  "Samples": 7,
+  "RunningStateSamples": 7,
+  "PausedStateSamples": 0,
+  "UnavailableStateSamples": 0,
+  "SamplesWithMeasuredPresentFps": 7,
+  "AvailableCpuSamples": 7,
+  "UnavailableCpuSamples": 0,
+  "ActualElapsedSeconds": 20.0449682,
+  "ProcessId": 5232,
+  "ProcessStartTimeUtc": "2026-11-12T13:29:05.5234182Z",
+  "Executable": "D:\\a\\Snow\\Snow\\build\\Release\\Snow.exe",
+  "ExecutableSha256": "73a4703eb247e8be2f361fff0ddd52f64aeb60ce7dfe34494f4ef86cc8bce688",
+  "Ownership": "Launch",
+  "CleanupStatus": "exited_normally",
+  "RendererRequested": "gdi",
+  "RendererActual": "gdi",
+  "RenderersObserved": [
+    "gdi"
+  ],
+  "BenchmarkRequested": true,
+  "LogicalProcessors": 4,
+  "LogicalProcessorSource": "Win32_ComputerSystem.NumberOfLogicalProcessors",
+  "CpuCounterSource": "GetProcessTimes",
+  "ProcessMemorySource": "K32GetProcessMemoryInfo/PROCESS_MEMORY_COUNTERS_EX",
+  "MonotonicClockFrequency": 10000000,
+  "OS": "Microsoft Windows NT 10.0.20348.0",
+  "PowerShellVersion": "7.6.9",
+  "Is64BitSampler": true,
+  "GpuAdapters": [
+    {
+      "Name": "Microsoft Hyper-V Video",
+      "DriverVersion": "10.0.20348.1"
+    }
+  ],
+  "CsvPath": "D:\\a\\Snow\\Snow\\build\\gdi-runner-metrics.csv"
+}
