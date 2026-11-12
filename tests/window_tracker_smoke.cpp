@@ -202,6 +202,12 @@ const snow::SurfaceSpec* findBounds(const std::vector<snow::SurfaceSpec>& surfac
     return found == surfaces.end() ? nullptr : &*found;
 }
 
+const snow::SurfaceSpec& checkedSurface(const std::vector<snow::SurfaceSpec>& surfaces, snow::Rect bounds) {
+    const auto* result = findBounds(surfaces, bounds);
+    if (!result) throw std::runtime_error("expected surface disappeared before inspection");
+    return *result;
+}
+
 int smokeMain() {
     Controller controller;
     snow::WindowTracker tracker;
@@ -247,7 +253,7 @@ int smokeMain() {
     snow::Rect expected = physicalBounds(helper.window());
     require(waitFor([&] { return findBounds(*surfaces, expected) != nullptr; }), "new window becomes a surface");
     require(controller.notifications > 0, "real WinEvents notify the UI window");
-    std::uint64_t identity = findBounds(*surfaces, expected)->id;
+    std::uint64_t identity = checkedSurface(*surfaces, expected).id;
     require(identity != 0, "surface receives a generation identity");
 
     const snow::Rect initialBounds = expected;
@@ -281,7 +287,7 @@ int smokeMain() {
     helper.send(Action::Restore);
     expected = physicalBounds(helper.window());
     require(waitFor([&] { return findBounds(*surfaces, expected) != nullptr; }), "restored window is rediscovered");
-    identity = findBounds(*surfaces, expected)->id;
+    identity = checkedSurface(*surfaces, expected).id;
 
     const snow::Rect restoredBounds = expected;
     helper.send(Action::Move, {originX - 120, originY + 180, originX + 480, originY + 480});
@@ -307,7 +313,7 @@ int smokeMain() {
     surfaces = &tracker.refresh();
     expected = physicalBounds(helper.window());
     const auto* beforeRecreate = findBounds(*surfaces, expected);
-    require(beforeRecreate != nullptr, "storm reconciliation observes final geometry");
+    if (!beforeRecreate) throw std::runtime_error("storm reconciliation observes final geometry");
     identity = beforeRecreate->id;
     helper.send(Action::Recreate);
     require(waitFor([&] {
@@ -315,7 +321,7 @@ int smokeMain() {
         return surface && surface->id != identity;
     }), "destroy and immediate recreate cannot inherit old snow identity");
 
-    identity = findBounds(*surfaces, expected)->id;
+    identity = checkedSurface(*surfaces, expected).id;
     helper.send(Action::Fullscreen, monitor.rcMonitor);
     expected = physicalBounds(helper.window());
     require(waitFor([&] {

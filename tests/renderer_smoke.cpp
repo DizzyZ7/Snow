@@ -181,12 +181,11 @@ bool visualAlpha(snow::RendererKind kind) {
     const int y = info.rcMonitor.top + 32;
     Window backdrop(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, BackdropClass);
     Window overlay(snow::Renderer::windowStyles(kind));
-    if (!expect(backdrop.hwnd != nullptr && overlay.hwnd != nullptr, "create visual test windows"))
-        return false;
-    if (!expect(SetWindowPos(backdrop.hwnd, HWND_TOPMOST, x, y, 96, 96,
+    if (!backdrop.hwnd || !overlay.hwnd) return expect(false, "create visual test windows");
+    if (!expect(backdrop.hwnd != nullptr && SetWindowPos(backdrop.hwnd, HWND_TOPMOST, x, y, 96, 96,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW) != FALSE, "show blue backdrop"))
         return false;
-    UpdateWindow(backdrop.hwnd);
+    if (backdrop.hwnd) UpdateWindow(backdrop.hwnd);
     pumpMessages();
     snow::Renderer renderer;
     if (!expect(renderer.initialize(overlay.hwnd, {x, y, x + 96, y + 96}, kind),

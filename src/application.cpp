@@ -20,7 +20,7 @@
 namespace snow {
 namespace {
 constexpr UINT TrayMessage = WM_APP + 1, TrackerMessage = WM_APP + 2;
-constexpr UINT_PTR ReconcileTimer = 2, SmokeTimer = 3, TrackerTimer = 4;
+constexpr UINT_PTR ReconcileTimer = 2, SmokeTimer = 3, TrackerTimer = 4, ModalFrameTimer = 5, SmokeMenuTimer = 6;
 constexpr int PauseId = 1001, ExitId = 1002, SettingsId = 1003, ClearId = 1004;
 constexpr int WeatherId = 1100, ProfileId = 1200, ToolId = 1300;
 constexpr int PauseHotkey = 1, ExitHotkey = 2, EscapeHotkey = 3;
@@ -92,7 +92,8 @@ struct Application::Impl {
     bool pauseHotkey{}, exitHotkey{}, escapeHotkey{}, sessionNotifications{}, policyPaused{true};
     HFONT settingsFont{};
     UINT settingsDpi{96};
-    unsigned smokeStage{};
+    unsigned smokeStage{}, modalDepth{};
+    bool inFrame{};
     std::uint64_t smokeSteps{};
     int result{}, interval{33};
 
@@ -112,7 +113,7 @@ struct Application::Impl {
         if (controller) {
             if (frameClock) CancelWaitableTimer(frameClock);
             frameTimer = false;
-            KillTimer(controller, ReconcileTimer); KillTimer(controller, SmokeTimer); KillTimer(controller, TrackerTimer);
+            KillTimer(controller, ReconcileTimer); KillTimer(controller, SmokeTimer); KillTimer(controller, TrackerTimer); KillTimer(controller, ModalFrameTimer); KillTimer(controller, SmokeMenuTimer);
             for (const wchar_t* key : {L"Snow.State", L"Snow.Renderer", L"Snow.Presents", L"Snow.IntervalMs", L"Snow.SuspendReasons", L"Snow.StatsTickMs"}) RemovePropW(controller, key);
             UnregisterHotKey(controller, PauseHotkey); UnregisterHotKey(controller, ExitHotkey); UnregisterHotKey(controller, EscapeHotkey);
             if (sessionNotifications) WTSUnRegisterSessionNotification(controller);
@@ -227,6 +228,12 @@ struct Application::Impl {
         put(L"Snow.SuspendReasons", (manualPause ? 1U : 0U) | (sessionLocked ? 2U : 0U) | (displayOff ? 4U : 0U) | (powerSuspended ? 8U : 0U) | (autoPause ? 16U : 0U));
         put(L"Snow.StatsTickMs", GetTickCount64());
     }
+    void modal(bool entered) {
+        if (entered) ++modalDepth; else if (modalDepth) --modalDepth;
+        if (!controller) return;
+        if (modalDepth && frameTimer) { if (!SetTimer(controller, ModalFrameTimer, static_cast<UINT>(interval), nullptr)) fail(); }
+        else KillTimer(controller, ModalFrameTimer);
+    }
     bool armFrameClock(int milliseconds) noexcept {
         if (!frameClock) return false;
         LARGE_INTEGER due{}; due.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000;
@@ -244,6 +251,10 @@ struct Application::Impl {
         if (!stop && !frameTimer) { frameTimer = armFrameClock(interval); if (!frameTimer) fail(); }
         for (const auto& ov : overlays) ShowWindow(ov->hwnd, stop ? SW_HIDE : SW_SHOWNOACTIVATE);
         if (stop && tool != Tool::None) setTool(Tool::None);
+        if (modalDepth) {
+            if (frameTimer) { if (!SetTimer(controller, ModalFrameTimer, static_cast<UINT>(interval), nullptr)) fail(); }
+            else KillTimer(controller, ModalFrameTimer);
+        }
         publishStats();
     }
     bool draw() {
@@ -252,7 +263,8 @@ struct Application::Impl {
         return true;
     }
     void frame() {
-        if (paused()) return;
+        if (paused() || inFrame) return;
+        struct FrameGuard { bool& flag; explicit FrameGuard(bool& value) : flag(value) { flag = true; } ~FrameGuard() { flag = false; } } guard(inFrame);
         const auto now = Clock::now(); const double elapsed = std::chrono::duration<double>(now - lastFrame).count(); lastFrame = now;
         simulation.advance(elapsed);
         if (!draw()) {
@@ -434,7 +446,15 @@ struct Application::Impl {
               const auto restored = parseSettings(content); if (!restored || restored->weather != Weather::Blizzard) { fail(); break; } }
             showSettings(); if (!settingsWindow) { fail(); break; } applySettings();
             DestroyWindow(settingsWindow); settingsWindow = nullptr;
-            overlays.clear(); if (!rebuildOverlays() || !draw()) fail();
+            overlays.clear(); if (!rebuildOverlays() || !draw()) { fail(); break; }
+            // A real popup owns a nested native loop. Keep animating inside it,
+            // and end it deterministically without synthesizing user input.
+            KillTimer(controller, SmokeTimer);
+            if (!SetTimer(controller, SmokeMenuTimer, 350, nullptr)) { fail(); break; }
+            { const auto before = simulation.steps(); menu();
+              KillTimer(controller, SmokeMenuTimer);
+              if (simulation.steps() <= before) { fail(); break; } }
+            if (!SetTimer(controller, SmokeTimer, 700, nullptr)) fail();
             break;
         default:
             if (simulation.steps() <= smokeSteps) result = 1;
@@ -461,6 +481,8 @@ struct Application::Impl {
     static LRESULT settingsDispatch(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (msg == WM_NCCREATE) { self = static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams); SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self)); }
+        if (self && msg == WM_ENTERSIZEMOVE) { self->modal(true); return 0; }
+        if (self && msg == WM_EXITSIZEMOVE) { self->modal(false); return 0; }
         if (self && msg == WM_COMMAND && LOWORD(wp) == ApplyControl) { self->applySettings(); return 0; }
         if (self && msg == WM_CLOSE) { self->settingsWindow = nullptr; DestroyWindow(hwnd); return 0; }
         if (self && msg == WM_DPICHANGED) { self->updateSettingsDpi(HIWORD(wp), true); const auto* r = reinterpret_cast<RECT*>(lp); SetWindowPos(hwnd, nullptr, r->left, r->top, r->right-r->left, r->bottom-r->top, SWP_NOZORDER | SWP_NOACTIVATE); return 0; }
@@ -484,8 +506,12 @@ struct Application::Impl {
         case TrayMessage:
             if (LOWORD(lp) == WM_CONTEXTMENU || LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT) self->menu();
             return 0;
+        case WM_ENTERMENULOOP: self->modal(true); return 0;
+        case WM_EXITMENULOOP: self->modal(false); return 0;
         case WM_TIMER:
-            if (wp == ReconcileTimer) self->reconcile();
+            if (wp == ModalFrameTimer && self->modalDepth && self->frameTimer) self->frame();
+            else if (wp == SmokeMenuTimer && self->smoke) { KillTimer(hwnd, SmokeMenuTimer); EndMenu(); }
+            else if (wp == ReconcileTimer) self->reconcile();
             else if (wp == SmokeTimer) self->smokeTick();
             else if (wp == TrackerTimer) { KillTimer(hwnd, TrackerTimer); self->simulation.accumulation().reconcile(self->tracker.refresh()); self->updatePolicy(); }
             return 0;
