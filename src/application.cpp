@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cwchar>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -74,6 +75,7 @@ struct Application::Impl {
     HWND controller{}, settingsWindow{};
     HANDLE mutex{}, frameClock{};
     NOTIFYICONDATAW tray{};
+    HICON appIcon{};
     UINT taskbarMessage{};
     std::vector<std::unique_ptr<Overlay>> overlays;
     std::vector<DrawItem> scene;
@@ -102,6 +104,7 @@ struct Application::Impl {
         shutdown();
         if (controller) { SetWindowLongPtrW(controller, GWLP_USERDATA, 0); DestroyWindow(controller); }
         if (settingsFont) DeleteObject(settingsFont);
+        if (appIcon) DestroyIcon(appIcon);
         if (frameClock) CloseHandle(frameClock);
         if (mutex) CloseHandle(mutex);
         if (smoke && !path.empty()) { std::error_code ec; std::filesystem::remove_all(path.parent_path(), ec); }
@@ -125,7 +128,10 @@ struct Application::Impl {
         overlays.clear();
         if (tray.hWnd) { Shell_NotifyIconW(NIM_DELETE, &tray); tray.hWnd = nullptr; }
     }
-    void fail() { result = 1; if (controller) PostMessageW(controller, WM_CLOSE, 0, 0); }
+    void fail(const char* reason = "native operation failed") {
+        if (smoke) std::fprintf(stderr, "Snow smoke stage %u: %s\n", smokeStage, reason);
+        result = 1; if (controller) PostMessageW(controller, WM_CLOSE, 0, 0);
+    }
     void load() {
         if (smoke) { path = std::filesystem::temp_directory_path() / (L"SnowSmoke-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64())) / L"settings.ini"; return; }
         path = configPath();
@@ -170,7 +176,7 @@ struct Application::Impl {
     bool addTray() {
         tray.cbSize = sizeof(tray); tray.hWnd = controller; tray.uID = 1;
         tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP; tray.uCallbackMessage = TrayMessage;
-        tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        tray.hIcon = appIcon;
         wcscpy_s(tray.szTip, L"Snow — снег на рабочем столе");
         if (!Shell_NotifyIconW(NIM_ADD, &tray)) return false;
         tray.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &tray); return true;
@@ -301,6 +307,7 @@ struct Application::Impl {
             if (!escapeHotkey) { balloon(L"Инструмент недоступен", L"Клавиша Escape занята другим приложением. Освободите ее и повторите."); return; }
         }
         if (value == Tool::None && escapeHotkey) { UnregisterHotKey(controller, EscapeHotkey); escapeHotkey = false; ReleaseCapture(); }
+        simulation.endInteraction();
         tool = value; lastInput = Clock::now();
         for (const auto& ov : overlays) {
             auto styles = GetWindowLongPtrW(ov->hwnd, GWL_EXSTYLE);
@@ -308,19 +315,20 @@ struct Application::Impl {
             SetWindowLongPtrW(ov->hwnd, GWL_EXSTYLE, styles);
             SetWindowPos(ov->hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
-        if (value != Tool::None) balloon(L"Режим инструментов", L"Зажмите левую кнопку для очистки. Снежок/снеговик создается кликом. Escape — выйти; выход также через трей.");
+        if (value != Tool::None) balloon(L"Режим инструментов", L"Левая кнопка: очистка или создание. Снежки можно катать и ставить друг на друга. Escape или правая кнопка — выйти.");
     }
     void interact(Overlay& ov, LPARAM lp, bool down) {
         if (tool == Tool::None) return;
         lastInput = Clock::now();
         const float x = static_cast<float>(ov.rect.left + GET_X_LPARAM(lp)), y = static_cast<float>(ov.rect.top + GET_Y_LPARAM(lp));
-        if (down || tool == Tool::Mitten || tool == Tool::Shovel) simulation.useTool(tool, x, y);
+        if (down) simulation.beginInteraction(tool, x, y);
+        else simulation.dragInteraction(x, y);
     }
     void command(UINT id) {
         if (id == PauseId) { manualPause = !manualPause; updatePolicy(); }
         else if (id == ExitId) PostMessageW(controller, WM_CLOSE, 0, 0);
         else if (id == SettingsId) showSettings();
-        else if (id == ClearId) { simulation.accumulation().reconcile({}); simulation.accumulation().reconcile(tracker.refresh()); }
+        else if (id == ClearId) simulation.clearSnow();
         else if (id >= WeatherId && id <= WeatherId + 4) { settings.weather = static_cast<Weather>(id - WeatherId); simulation.setSettings(settings); persist(); }
         else if (id >= ProfileId && id <= ProfileId + 2) { settings.profile = static_cast<Profile>(id - ProfileId); simulation.setSettings(settings); updatePolicy(); persist(); }
         else if (id >= ToolId && id <= ToolId + 4) setTool(static_cast<Tool>(id - ToolId));
@@ -343,7 +351,11 @@ struct Application::Impl {
         AppendMenuW(root, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(root, MF_STRING, ExitId, L"Выход\tCtrl+Alt+F12");
         POINT cursor{}; GetCursorPos(&cursor); SetForegroundWindow(controller);
+        // TPM_NONOTIFY does not provide a reliable enter/exit contract to the
+        // owner, so explicitly bracket our own native popup's modal loop.
+        modal(true);
         const UINT selected = static_cast<UINT>(TrackPopupMenu(root, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, cursor.x, cursor.y, 0, controller, nullptr));
+        modal(false);
         DestroyMenu(root); PostMessageW(controller, WM_NULL, 0, 0); if (selected) command(selected);
     }
     HWND control(const wchar_t* klass, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id) {
@@ -428,6 +440,7 @@ struct Application::Impl {
         if (!smoke && !setAutostart(autostart)) MessageBoxW(settingsWindow, L"Не удалось изменить автозапуск Windows.", L"Snow", MB_OK | MB_ICONERROR);
     }
     void smokeTick() {
+        std::fprintf(stderr, "Snow smoke entering stage %u\n", smokeStage);
         switch (smokeStage++) {
         case 0:
             if (simulation.steps() == 0 || overlays.empty()) { fail(); break; }
@@ -447,13 +460,18 @@ struct Application::Impl {
             showSettings(); if (!settingsWindow) { fail(); break; } applySettings();
             DestroyWindow(settingsWindow); settingsWindow = nullptr;
             overlays.clear(); if (!rebuildOverlays() || !draw()) { fail(); break; }
+            { const HWND captureTarget = overlays.front()->hwnd;
+              SetCapture(captureTarget);
+              if (GetCapture() != captureTarget) { fail("cannot establish cancellation fixture capture"); break; }
+              SendMessageW(captureTarget, WM_CANCELMODE, 0, 0);
+              if (GetCapture() == captureTarget) { fail("WM_CANCELMODE left mouse captured"); break; } }
             // A real popup owns a nested native loop. Keep animating inside it,
             // and end it deterministically without synthesizing user input.
             KillTimer(controller, SmokeTimer);
             if (!SetTimer(controller, SmokeMenuTimer, 350, nullptr)) { fail(); break; }
             { const auto before = simulation.steps(); menu();
               KillTimer(controller, SmokeMenuTimer);
-              if (simulation.steps() <= before) { fail(); break; } }
+              if (simulation.steps() <= before) { fail("native menu stalled frame clock"); break; } }
             if (!SetTimer(controller, SmokeTimer, 700, nullptr)) fail();
             break;
         default:
@@ -469,7 +487,13 @@ struct Application::Impl {
         if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
         if (msg == WM_ERASEBKGND) return 1;
         if (msg == WM_LBUTTONDOWN) { SetCapture(hwnd); ov->owner->interact(*ov, lp, true); return 0; }
-        if (msg == WM_LBUTTONUP) { ReleaseCapture(); return 0; }
+        if (msg == WM_LBUTTONUP) { ov->owner->simulation.endInteraction(); ReleaseCapture(); return 0; }
+        if (msg == WM_CAPTURECHANGED) { ov->owner->simulation.endInteraction(); return 0; }
+        if (msg == WM_CANCELMODE) {
+            ov->owner->simulation.endInteraction();
+            if (GetCapture() == hwnd) ReleaseCapture();
+            return 0;
+        }
         if (msg == WM_MOUSEMOVE && (wp & MK_LBUTTON)) { ov->owner->interact(*ov, lp, false); return 0; }
         if (msg == WM_RBUTTONUP) { ov->owner->setTool(Tool::None); return 0; }
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -557,9 +581,12 @@ struct Application::Impl {
         struct ComGuard { Impl* self; HRESULT hr; ~ComGuard() { self->shutdown(); if (SUCCEEDED(hr)) CoUninitialize(); } } guard{this, com};
         INITCOMMONCONTROLSEX common{sizeof(common), ICC_BAR_CLASSES}; if (!InitCommonControlsEx(&common)) return 1;
         load(); simulation.setSettings(settings);
+        appIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(101), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+        if (!appIcon) return 1;
         const auto registerClass = [&](const wchar_t* name, WNDPROC procedure, HBRUSH background) {
             WNDCLASSEXW cls{}; cls.cbSize = sizeof(cls); cls.hInstance = instance; cls.lpfnWndProc = procedure;
-            cls.lpszClassName = name; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = background;
+            cls.lpszClassName = name; cls.hIcon = appIcon; cls.hIconSm = appIcon; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = background;
             return RegisterClassExW(&cls) != 0;
         };
         if (!registerClass(ControllerClass, controllerProc, nullptr) || !registerClass(OverlayClass, overlayProc, nullptr) ||

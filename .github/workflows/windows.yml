@@ -28,14 +28,18 @@ jobs:
         if: matrix.config == 'Release'
         shell: pwsh
         run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -DurationSeconds 20 -IntervalSeconds 3 -Benchmark -OutputPath build/gdi-runner-metrics.csv
+      - name: GPU candidate comparison (same hosted runner)
+        if: matrix.config == 'Release'
+        shell: pwsh
+        run: ./tools/Measure-Snow.ps1 -Exe build/Release/Snow.exe -Renderer d3d11 -DurationSeconds 20 -IntervalSeconds 3 -Benchmark -OutputPath build/d3d11-runner-metrics.csv
       - name: Portable and per-user installer
         if: matrix.config == 'Release'
         shell: pwsh
-        run: ./tools/Package-Snow.ps1 -Exe build/Release/Snow.exe -Version 0.2.0 -OutputDirectory build/package -RequireInstaller
+        run: ./tools/Package-Snow.ps1 -Exe build/Release/Snow.exe -Version 0.3.0 -OutputDirectory build/package -RequireInstaller
       - name: Install, exercise and uninstall the preview
         if: matrix.config == 'Release'
         shell: pwsh
-        run: ./tests/installer_smoke.ps1 -Setup build/package/Snow-0.2.0-windows-x64-setup.exe
+        run: ./tests/installer_smoke.ps1 -Setup build/package/Snow-0.3.0-windows-x64-setup.exe
       - name: Upload preview build and evidence
         if: matrix.config == 'Release'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

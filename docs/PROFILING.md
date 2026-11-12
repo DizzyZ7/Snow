@@ -129,6 +129,33 @@ low CPU and memory values that describe a paused process. Those values cannot
 establish active rendering performance. CI is still not an interactive desktop
 quality or long-duration performance verdict.
 
+Validate the counter path before accepting CPU measurements:
+
+```powershell
+.\tests\profiler_smoke.ps1
+```
+
+This standalone Windows test imports the same production native query module
+used by the sampler, opens its own process, performs real arithmetic work in
+250ms batches, and requires at least 50ms of accumulated CPU time to appear
+within a bounded ten-second diagnostic window. It checks that the production
+interval calculation returns a finite positive rate and that invalid-handle
+counters remain null. It does not launch Snow, require desktop graphics, mock
+native queries, or impose an application performance target. Run it in the
+same PowerShell environment used for profiling; failure makes CPU evidence
+inconclusive until investigated.
+
+Some earlier CI samples had a constant cumulative `Process.TotalProcessorTime`
+despite increasing native submissions; later samples did advance. This does
+not establish a .NET caching defect, and the earlier zero deltas must not be
+cited as low-CPU evidence. The sampler now calls `GetProcessTimes` afresh on
+a held, identity-checked process handle for its baseline and every sample, and
+queries process memory afresh with `K32GetProcessMemoryInfo`. This hardens
+measurement against managed property snapshots without claiming a proven CPU
+cache bug. Current .NET Windows source also calls `GetProcessTimes` for its
+CPU getter. Retain the self-test outcome and fresh profile alongside any CPU
+claim; accounting resolution and host behavior still matter.
+
 Rename output paths for each repetition; existing CSV/metadata files cause an
 error. The default duration is 300 seconds, the default renderer is `gdi`, and
 `-IntervalSeconds` accepts 1 through 60. Short intervals increase observer cost.
@@ -140,7 +167,9 @@ Total wall-clock duration can exceed the requested duration by collection and
 graceful shutdown overhead. The `*.metadata.json` companion is always
 attempted, including failures; it records run outcome, environment, executable
 hash, sample count, requested interval, elapsed sampling time, observed renderer
-set and counts of running, paused, unavailable-state and measured-rate samples.
+set and counts of running, paused, unavailable-state, measured-rate and
+available/unavailable CPU samples. Schema version 3 records native CPU/memory
+sources and the monotonic clock frequency.
 
 To attach without changing or terminating an existing process:
 
@@ -178,11 +207,13 @@ columns distinguish absent instances, missing properties and query failures.
 | `SuspendReasons` | Published bit flags: manual pause `1`, session `2`, display `4`, power `8`, fullscreen `16`. Flags can be combined; zero is a valid published value. |
 | `StatsTickMs`, `ControllerStatsStatus` | Application publication time from `GetTickCount64`, plus stats availability/read status. The native properties update about every two seconds and on state changes, rather than per frame. An unchanged tick yields no measured rate. |
 | `BenchmarkRequested` | Whether the sampler launched with `--benchmark`; empty for attached processes. This changes only fullscreen-pause policy. |
-| `CpuPercentOfMachine` | Delta of `Process.TotalProcessorTime`, divided by actual monotonic interval and logical processor count, times 100. A fully occupied logical CPU is approximately `100 / LogicalProcessors` percent. |
-| `CpuTotalSeconds` | Cumulative user plus kernel process CPU time at the sampling point. |
-| `PrivateBytes` | `Process.PrivateMemorySize64`: process private committed memory, including nonresident pages. |
+| `CpuPercentOfMachine` | Delta of fresh `GetProcessTimes` kernel plus user time, divided by the actual monotonic query interval and logical processor count, times 100. A fully occupied logical CPU is approximately `100 / LogicalProcessors` percent. Unavailable queries/baselines or invalid counters/intervals leave the rate empty. |
+| `CpuTotalSeconds`, `CpuDeltaSeconds` | Cumulative kernel plus user CPU time and its interval delta, converted from native 100ns units to seconds. Integer counters are subtracted before conversion. An unavailable current query leaves both empty. |
+| `CpuCounterSource`, `CpuCounterStatus` | Explicit CPU source (`GetProcessTimes`) and availability/error status. A successful zero advance is distinct from an unavailable counter. |
+| `PrivateBytes` | Fresh `K32GetProcessMemoryInfo`, `PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`: process private committed memory, including nonresident pages. |
 | `CommitSizeBytes` | The same private-commit value as `PrivateBytes`, provided with its Task Manager label. These columns are aliases and must never be added together. It is not virtual address-space size or system-wide commit. |
-| `WorkingSetBytes` | `Process.WorkingSet64`: resident process pages, including private and shareable pages. |
+| `WorkingSetBytes` | Fresh `PROCESS_MEMORY_COUNTERS_EX.WorkingSetSize`: resident process pages, including private and shareable pages. |
+| `ProcessMemorySource`, `ProcessMemoryStatus` | Explicit native memory source and availability/error status. Failed queries leave private commit and working set empty. |
 | `PrivateWorkingSetBytes` | `Win32_PerfRawData_PerfProc_Process.WorkingSetPrivate`, selected by exact `IDProcess`: resident private pages only. Unavailable providers/properties remain empty. |
 | `GdiObjects`, `UserObjects` | `GetGuiResources` for the sampled process handle. Errors remain empty; zero without a Win32 error is valid. |
 | `GpuDedicatedBytes`, `GpuSharedBytes` | `DedicatedUsage` and `SharedUsage` from `Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory`, summed over all adapter instances whose name starts with the exact `pid_<PID>_` prefix. No matching process instance produces empty fields, including in GDI-only or unsupported-driver sessions. |
@@ -191,7 +222,14 @@ columns distinguish absent instances, missing properties and query failures.
 
 The metadata records whether logical processor count came from
 `Win32_ComputerSystem` or the count visible to PowerShell. The independent
-providers are not sampled atomically. Controller reads use the exact PID and
+providers are not sampled atomically. Native CPU timestamps use the midpoint
+of `Stopwatch.GetTimestamp` readings around `GetProcessTimes`, so CPU intervals
+include actual scheduling/collection delays. Its 100ns unit does not guarantee
+100ns accounting resolution: a successful zero delta means the counter did
+not advance at its available resolution, not proof that no instructions ran.
+The native process handle is opened once, held through sampling and checked
+against creation time. Liveness is checked after collection before writing a
+row, so PID reuse cannot retarget native queries. Controller reads use the exact PID and
 `SnowControllerV2` class; positive state/renderer/interval/publication sentinels
 distinguish unavailable protocol data from valid zero counts and flags. A
 publication tick change during reading is retried. A 32-bit sampler leaves
@@ -256,7 +294,11 @@ without establishing the full desktop quality bar.
 Definition references:
 
 - [Microsoft memory counter/Task Manager mappings](https://learn.microsoft.com/en-us/windows/win32/memory/memory-performance-information)
-- [Process.PrivateMemorySize64](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64)
+- [GetProcessTimes and CPU time units](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes)
+- [GetProcessMemoryInfo](https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getprocessmemoryinfo)
+- [PROCESS_MEMORY_COUNTERS_EX](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex)
+- [.NET Windows Process implementation](https://github.com/dotnet/runtime/blob/main/src/libraries/System.Diagnostics.Process/src/System/Diagnostics/Process.Windows.cs)
+- [Process.Refresh and managed snapshots](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.refresh)
 - [GetGuiResources](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getguiresources)
 - [GPU accounting in Task Manager](https://devblogs.microsoft.com/directx/gpus-in-the-task-manager/)
 - [Known Windows 10 GPU process memory counter issue](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/gpu-process-memory-counters-report-wrong-value)

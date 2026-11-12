@@ -24,116 +24,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($env:OS -ne 'Windows_NT') { throw 'Measure-Snow requires Windows.' }
 
-# Compile before launching: even setup failures must not leave a new process behind.
-if (-not ('SnowProfilingV2.Native' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-namespace SnowProfilingV2 {
-    public sealed class ControllerStats {
-        public uint State;
-        public uint Renderer;
-        public ulong Presents;
-        public uint IntervalMs;
-        public uint SuspendReasons;
-        public ulong StatsTickMs;
-        public string Status = "controller_not_found";
-    }
-    public static class Native {
-        private delegate bool EnumWindowsProc(IntPtr window, IntPtr argument);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetGuiResources(IntPtr process, uint flags);
-        [DllImport("kernel32.dll", EntryPoint = "SetLastError")]
-        private static extern void ClearLastError(uint error);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr argument);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll", EntryPoint = "GetPropW", CharSet = CharSet.Unicode, ExactSpelling = true)]
-        private static extern IntPtr GetProp(IntPtr window, string name);
-
-        public static ControllerStats GetControllerStats(uint expectedProcessId) {
-            var result = new ControllerStats();
-            if (IntPtr.Size != 8) { result.Status = "unsupported_32_bit_sampler"; return result; }
-            IntPtr controller = IntPtr.Zero;
-            int matches = 0;
-            EnumWindowsProc callback = delegate(IntPtr window, IntPtr unused) {
-                uint owner;
-                GetWindowThreadProcessId(window, out owner);
-                if (owner != expectedProcessId) return true;
-                var name = new StringBuilder(256);
-                if (GetClassName(window, name, name.Capacity) > 0 && name.ToString() == "SnowControllerV2") {
-                    controller = window;
-                    ++matches;
-                }
-                return true;
-            };
-            if (!EnumWindows(callback, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (matches == 0) return result;
-            if (matches != 1) { result.Status = "no_unique_controller"; return result; }
-            for (int attempt = 0; attempt < 3; ++attempt) {
-                long before = GetProp(controller, "Snow.StatsTickMs").ToInt64();
-                long state = GetProp(controller, "Snow.State").ToInt64();
-                long renderer = GetProp(controller, "Snow.Renderer").ToInt64();
-                long interval = GetProp(controller, "Snow.IntervalMs").ToInt64();
-                ulong presents = unchecked((ulong)GetProp(controller, "Snow.Presents").ToInt64());
-                ulong reasons = unchecked((ulong)GetProp(controller, "Snow.SuspendReasons").ToInt64());
-                long after = GetProp(controller, "Snow.StatsTickMs").ToInt64();
-                if (before != after) continue;
-                // Positive protocol sentinels distinguish absent stats from legitimate zero counts/flags.
-                if (before <= 0 || (state != 1 && state != 2) || renderer < 1 || renderer > 3 || interval <= 0 || interval > uint.MaxValue || reasons > uint.MaxValue) {
-                    result.Status = "properties_unavailable_or_invalid";
-                    return result;
-                }
-                result.State = (uint)state;
-                result.Renderer = (uint)renderer;
-                result.IntervalMs = (uint)interval;
-                result.Presents = presents;
-                result.SuspendReasons = (uint)reasons;
-                result.StatsTickMs = (ulong)after;
-                result.Status = "available";
-                return result;
-            }
-            result.Status = "publication_changed_during_read";
-            return result;
-        }
-
-        public static uint GuiCount(IntPtr process, uint flags) {
-            ClearLastError(0);
-            uint value = GetGuiResources(process, flags);
-            int error = Marshal.GetLastWin32Error();
-            if (value == 0 && error != 0) throw new Win32Exception(error);
-            return value;
-        }
-
-        public static int RequestClose(uint expectedProcessId) {
-            int posted = 0;
-            int error = 0;
-            EnumWindowsProc callback = delegate(IntPtr window, IntPtr unused) {
-                uint owner;
-                GetWindowThreadProcessId(window, out owner);
-                if (owner != expectedProcessId) return true;
-                var name = new StringBuilder(256);
-                if (GetClassName(window, name, name.Capacity) > 0 && name.ToString() == "SnowControllerV2") {
-                    if (PostMessage(window, 0x0010, IntPtr.Zero, IntPtr.Zero)) ++posted;
-                    else error = Marshal.GetLastWin32Error();
-                }
-                return true;
-            };
-            if (!EnumWindows(callback, IntPtr.Zero)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (error != 0) throw new Win32Exception(error);
-            return posted;
-        }
-    }
-}
-'@
-}
+# Load and compile all native query helpers before launching a process.
+Import-Module (Join-Path $PSScriptRoot 'Snow-Profiling.psm1') -Force
 
 function Get-SnowControllerStats {
     param([int]$TargetId)
@@ -142,7 +34,7 @@ function Get-SnowControllerStats {
         StatsTickMs = $null; SuspendReasons = $null; Status = 'unavailable'
     }
     try {
-        $nativeStats = [SnowProfilingV2.Native]::GetControllerStats([uint32]$TargetId)
+        $nativeStats = [SnowProfilingV3.Native]::GetControllerStats([uint32]$TargetId)
         $snapshot.Status = $nativeStats.Status
         if ($nativeStats.Status -eq 'available') {
             $snapshot.State = if ($nativeStats.State -eq 1) { 'running' } else { 'paused' }
@@ -217,7 +109,7 @@ function Stop-OwnedSnow {
             return
         }
         if ($Target.StartTime.ToUniversalTime().Ticks -ne $ExpectedStartTicks) { throw 'Process identity changed; refusing to send WM_CLOSE.' }
-        [void][SnowProfilingV2.Native]::RequestClose([uint32]$Target.Id)
+        [void][SnowProfilingV3.Native]::RequestClose([uint32]$Target.Id)
         [void]$Target.WaitForExit([Math]::Min(1000, $IntervalSeconds * 1000))
     }
     $Target.Refresh()
@@ -255,7 +147,7 @@ try {
 catch { Write-Warning 'GPU adapter metadata is unavailable; individual sample status fields still report counter availability.' }
 
 $metadata = [ordered]@{
-    SchemaVersion = 2
+    SchemaVersion = 3
     Status = 'starting'
     Error = $null
     StartedUtc = [DateTime]::UtcNow.ToString('o')
@@ -267,6 +159,8 @@ $metadata = [ordered]@{
     PausedStateSamples = 0
     UnavailableStateSamples = 0
     SamplesWithMeasuredPresentFps = 0
+    AvailableCpuSamples = 0
+    UnavailableCpuSamples = 0
     ActualElapsedSeconds = 0
     ProcessId = $null
     ProcessStartTimeUtc = $null
@@ -280,6 +174,9 @@ $metadata = [ordered]@{
     BenchmarkRequested = if ($PSCmdlet.ParameterSetName -eq 'Launch') { [bool]$Benchmark } else { $null }
     LogicalProcessors = $logicalProcessors
     LogicalProcessorSource = $logicalProcessorSource
+    CpuCounterSource = 'GetProcessTimes'
+    ProcessMemorySource = 'K32GetProcessMemoryInfo/PROCESS_MEMORY_COUNTERS_EX'
+    MonotonicClockFrequency = [System.Diagnostics.Stopwatch]::Frequency
     OS = [Environment]::OSVersion.VersionString
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
     Is64BitSampler = [Environment]::Is64BitProcess
@@ -287,6 +184,7 @@ $metadata = [ordered]@{
     CsvPath = $csvPath
 }
 $target = $null
+$nativeHandle = $null
 $owned = $false
 $startTicks = [long]0
 $watch = $null
@@ -302,6 +200,9 @@ try {
     $target.Refresh()
     if ($target.HasExited) { throw 'Target exited before sampling. Close an existing Snow instance before starting a new profile.' }
     $startTicks = $target.StartTime.ToUniversalTime().Ticks
+    $expectedCreationFileTime = [uint64]$target.StartTime.ToUniversalTime().ToFileTimeUtc()
+    $nativeHandle = Open-SnowNativeProcess -ProcessId $target.Id
+    if (-not (Test-SnowNativeProcessRunning -Handle $nativeHandle)) { throw 'Target exited before native sampling could start.' }
     $metadata.ProcessId = $target.Id
     $metadata.ProcessStartTimeUtc = $target.StartTime.ToUniversalTime().ToString('o')
     $metadata.CleanupStatus = if ($owned) { 'pending' } else { 'attached_process_left_running' }
@@ -310,9 +211,12 @@ try {
         $metadata.ExecutableSha256 = (Get-FileHash -LiteralPath $target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     catch { Write-Warning 'Executable path/hash is unavailable for the attached process.' }
-    $previousCpuSeconds = $target.TotalProcessorTime.TotalSeconds
-    $previousElapsed = [double]0
     $previousControllerStats = Get-SnowControllerStats $target.Id
+    $previousNative = Get-SnowNativeProcessSnapshot -Handle $nativeHandle
+    if ($null -ne $previousNative.CreationTimeFileTimeUtc -and $previousNative.CreationTimeFileTimeUtc -ne $expectedCreationFileTime) {
+        throw 'Native handle creation time differs from the selected process; refusing to sample a reused PID.'
+    }
+    $baselineTimestamp = $previousNative.CpuSampleTimestamp
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $nextSample = [double][Math]::Min($IntervalSeconds, $DurationSeconds)
     $metadata.Status = 'running'
@@ -326,17 +230,21 @@ try {
         $target.Refresh()
         if ($target.HasExited) { throw "Target exited before the requested duration (exit code $($target.ExitCode))." }
         if ($target.StartTime.ToUniversalTime().Ticks -ne $startTicks) { throw 'Process identity changed; refusing to sample a reused PID.' }
-        $elapsed = $watch.Elapsed.TotalSeconds
+        if (-not (Test-SnowNativeProcessRunning -Handle $nativeHandle)) { throw 'The exact opened target process exited before sampling.' }
+        $native = Get-SnowNativeProcessSnapshot -Handle $nativeHandle
+        if ($null -ne $native.CreationTimeFileTimeUtc -and $native.CreationTimeFileTimeUtc -ne $expectedCreationFileTime) {
+            throw 'Native process creation time changed; refusing to sample a reused PID.'
+        }
+        $elapsed = [double]($native.CpuSampleTimestamp - $baselineTimestamp) / [System.Diagnostics.Stopwatch]::Frequency
         $timestamp = [DateTime]::UtcNow.ToString('o')
-        $cpuSeconds = $target.TotalProcessorTime.TotalSeconds
-        $actualInterval = $elapsed - $previousElapsed
-        $cpuDelta = $cpuSeconds - $previousCpuSeconds
-        if ($actualInterval -le 0 -or $cpuDelta -lt 0) { throw 'Invalid CPU measurement interval; no fabricated sample will be written.' }
+        $cpuInterval = Get-SnowCpuInterval -Previous $previousNative -Current $native -LogicalProcessors $logicalProcessors
+        $actualInterval = $cpuInterval.IntervalSeconds
+        if ($actualInterval -le 0) { throw 'Invalid monotonic measurement interval; no fabricated sample will be written.' }
         $errors = New-Object 'System.Collections.Generic.List[string]'
-        $privateBytes = Read-OptionalProcessValue { $target.PrivateMemorySize64 } 'PrivateBytes' $errors
-        $workingSet = Read-OptionalProcessValue { $target.WorkingSet64 } 'WorkingSetBytes' $errors
-        $gdiObjects = Read-OptionalProcessValue { [SnowProfilingV2.Native]::GuiCount($target.Handle, 0) } 'GdiObjects' $errors
-        $userObjects = Read-OptionalProcessValue { [SnowProfilingV2.Native]::GuiCount($target.Handle, 1) } 'UserObjects' $errors
+        $privateBytes = $native.PrivateBytes
+        $workingSet = $native.WorkingSetBytes
+        $gdiObjects = Read-OptionalProcessValue { [SnowProfilingV3.Native]::GuiCount($nativeHandle.DangerousGetHandle(), 0) } 'GdiObjects' $errors
+        $userObjects = Read-OptionalProcessValue { [SnowProfilingV3.Native]::GuiCount($nativeHandle.DangerousGetHandle(), 1) } 'UserObjects' $errors
         $controllerStats = Get-SnowControllerStats $target.Id
         $measuredPresentFps = $null
         if ($controllerStats.Status -eq 'available' -and $previousControllerStats.Status -eq 'available' -and
@@ -355,7 +263,11 @@ try {
         }
         $privateWorkingSet = Get-PrivateWorkingSet $target.Id
         $gpuMemory = Get-GpuProcessMemory $target.Id
+        if (-not (Test-SnowNativeProcessRunning -Handle $nativeHandle)) {
+            throw 'The exact target process exited during collection; no potentially reused-PID row was written.'
+        }
         $collection.Stop()
+        $cpuPercent = if ($null -ne $cpuInterval.CpuPercentOfMachine) { [Math]::Round($cpuInterval.CpuPercentOfMachine, 6) } else { $null }
         $row = [pscustomobject][ordered]@{
             TimestampUtc = $timestamp
             ElapsedSeconds = [Math]::Round($elapsed, 6)
@@ -373,8 +285,13 @@ try {
             StatsTickMs = $controllerStats.StatsTickMs
             ControllerStatsStatus = $controllerStats.Status
             LogicalProcessors = $logicalProcessors
-            CpuTotalSeconds = $cpuSeconds
-            CpuPercentOfMachine = [Math]::Round(100.0 * $cpuDelta / $actualInterval / $logicalProcessors, 6)
+            CpuCounterSource = $metadata.CpuCounterSource
+            CpuCounterStatus = $cpuInterval.CpuStatus
+            CpuTotalSeconds = $cpuInterval.CpuTotalSeconds
+            CpuDeltaSeconds = $cpuInterval.CpuDeltaSeconds
+            CpuPercentOfMachine = $cpuPercent
+            ProcessMemorySource = $metadata.ProcessMemorySource
+            ProcessMemoryStatus = $native.MemoryStatus
             PrivateBytes = $privateBytes
             CommitSizeBytes = $privateBytes
             WorkingSetBytes = $workingSet
@@ -395,8 +312,9 @@ try {
         elseif ($controllerStats.State -eq 'paused') { ++$metadata.PausedStateSamples }
         else { ++$metadata.UnavailableStateSamples }
         if ($null -ne $measuredPresentFps) { ++$metadata.SamplesWithMeasuredPresentFps }
-        $previousCpuSeconds = $cpuSeconds
-        $previousElapsed = $elapsed
+        if ($cpuInterval.CpuStatus -eq 'available' -and $null -ne $cpuPercent) { ++$metadata.AvailableCpuSamples }
+        else { ++$metadata.UnavailableCpuSamples }
+        $previousNative = $native
         $previousControllerStats = $controllerStats
         if ($elapsed -ge $DurationSeconds) { break }
         # Skip missed deadlines rather than inventing catch-up samples.
@@ -430,6 +348,7 @@ finally {
     try { $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding UTF8 }
     catch { if ($null -eq $failure) { $failure = $_ } else { Write-Warning "Could not save metadata: $($_.Exception.Message)" } }
     if ($null -ne $target) { $target.Dispose() }
+    if ($null -ne $nativeHandle) { $nativeHandle.Dispose() }
 }
 if ($null -ne $failure) { throw $failure }
 Write-Host "Recorded $($metadata.Samples) real samples: $csvPath"

@@ -1,9 +1,9 @@
 ; Inno Setup 6.3+; tools/Package-Snow.ps1 supplies the build paths and version.
 #ifndef SnowVersion
-  #define SnowVersion "0.2.0"
+  #define SnowVersion "0.3.0"
 #endif
 #ifndef SnowNumericVersion
-  #define SnowNumericVersion "0.2.0.0"
+  #define SnowNumericVersion "0.3.0.0"
 #endif
 #ifndef SnowSourceExe
   #define SnowSourceExe SourcePath + "..\build\Release\Snow.exe"
