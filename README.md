@@ -2,6 +2,14 @@
 
 Нативный снегопад для Windows 10/11 x64 на C++20 и Win32. Версия 0.3.0 — предварительная: функциональное равенство Flake и длительная стабильность еще не подтверждены.
 
+## Скачать для Windows
+
+- [Установщик Snow 0.3](https://github.com/DizzyZ7/Snow/releases/download/v0.3.0-preview/Snow-0.3.0-windows-x64-setup.exe)
+- [Snow.exe — запуск без установки](https://github.com/DizzyZ7/Snow/releases/download/v0.3.0-preview/Snow.exe)
+- [Portable ZIP](https://github.com/DizzyZ7/Snow/releases/download/v0.3.0-preview/Snow-0.3.0-windows-x64.zip)
+
+Предварительная версия для Windows 10/11 x64. После запуска ищите снежинку в системном трее. [Страница версии и контрольные суммы](https://github.com/DizzyZ7/Snow/releases/tag/v0.3.0-preview).
+
 ## Возможности в коде
 
 - Пять погодных режимов, плавное изменение ветра/плотности, детерминированная физика.

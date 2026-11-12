@@ -1,0 +1,98 @@
+name: Publish tested preview
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/publish-preview.yml]
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Successful Windows build run containing the tested preview
+        required: true
+        default: '43228547197'
+permissions:
+  contents: read
+concurrency:
+  group: snow-publish-preview
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.build_run || '43228547197' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Verify tested source and successful checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > source-run.json
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          run = json.loads(Path('source-run.json').read_text())
+          assert run['conclusion'] == 'success', 'Source Windows build is not successful'
+          assert run['name'] == 'Windows build', 'Unexpected build workflow'
+          assert run['head_repository']['full_name'] == os.environ['GITHUB_REPOSITORY'], 'Foreign source repository'
+          sha = run['head_sha']
+          changed = subprocess.check_output(['git', 'diff', '--name-only', sha, 'HEAD'], text=True).splitlines()
+          allowed = {'README.md', '.github/workflows/publish-preview.yml'}
+          assert not (set(changed) - allowed), f'Application differs from tested source: {changed}'
+          response = subprocess.check_output(['gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs?head_sha={sha}&per_page=100"], text=True)
+          runs = json.loads(response)['workflow_runs']
+          assert any(r['name'] == 'Portable core sanitizers' and r['conclusion'] == 'success' for r in runs), 'Portable sanitizer checks are not successful'
+          print('Verified tested source:', sha)
+          PY
+      - name: Download and verify the tested packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name Snow-Windows-x64-preview --dir out
+          python3 - <<'PY'
+          import hashlib, json, re, zipfile
+          from pathlib import Path
+          root = Path('out')
+          package = root / 'package'
+          for line in (package / 'SHA256SUMS.txt').read_text().splitlines():
+              expected, name = line.split('  ', 1)
+              path = package / name
+              assert path.parent == package, 'Unexpected checksum path'
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, f'Checksum failed: {name}'
+          metadata = list(package.glob('*-metadata.json'))
+          assert len(metadata) == 1, 'Package metadata is ambiguous'
+          meta = json.loads(metadata[0].read_text(encoding='utf-8-sig'))
+          version = meta['Version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version), 'Invalid preview version'
+          exe = (root / 'Release' / 'Snow.exe').read_bytes()
+          digest = hashlib.sha256(exe).hexdigest()
+          assert digest == meta['ExecutableSha256'], 'Executable differs from tested package'
+          portable = list(package.glob('*-windows-x64.zip'))
+          assert len(portable) == 1, 'Portable package is ambiguous'
+          with zipfile.ZipFile(portable[0]) as archive:
+              names = [n for n in archive.namelist() if n.endswith('/Snow.exe')]
+              assert len(names) == 1
+              assert hashlib.sha256(archive.read(names[0])).hexdigest() == digest
+          (root / 'Snow.exe.sha256').write_text(digest + '  Snow.exe\n')
+          Path('preview-version.txt').write_text(version)
+          print('Verified Snow.exe SHA-256:', digest)
+          PY
+      - name: Publish downloadable preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat preview-version.txt)
+          tag="v$version-preview"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Preview $tag already exists; existing release files are retained."
+            exit 0
+          fi
+          gh release create "$tag" out/Release/Snow.exe out/Snow.exe.sha256 out/package/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Snow $version Preview" \
+            --notes-file "out/package/Snow-$version-windows-x64-RELEASE-NOTES.txt"
